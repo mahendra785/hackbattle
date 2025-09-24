@@ -1,27 +1,29 @@
+// src/app/chat/[id]/page.tsx
 "use client";
 
 import Image from "next/image";
 import { useEffect, useMemo, useRef, useState } from "react";
 import * as d3 from "d3";
-import { Send, BookOpen, Play, FileText, ExternalLink } from "lucide-react";
+import { Send } from "lucide-react";
 import { useSession } from "next-auth/react";
 import { saveChatSnapshot } from "@/app/actions/chat";
 import { savePlanAsPathway } from "@/app/actions/pathway";
+import { classifyPrompt } from "@/app/actions/nlu";
+import {
+  generatePractice,
+  type GeneratedMCQ,
+  type GeneratedTextQ,
+} from "@/app/actions/quiz";
 import { useParams } from "next/navigation";
 import MCQCard from "../../../components/mcq";
 import TextAnswerCard from "../../../components/Text";
 import YoutubeRecs from "../../../components/YoutubeRecs";
 
-
 /* =========================
    Types
 ========================= */
-type ChatMessage = {
-  id: string;
-  type: "user" | "ai";
-  content: string;
-  timestamp: number;
-};
+type BaseMessage = { id: string; timestamp: number };
+type TextMessage = BaseMessage & { type: "user" | "ai"; content: string };
 
 type RoadmapSubtopic = { type: "SUBTOPIC"; name: string };
 type RoadmapTopic = {
@@ -31,10 +33,22 @@ type RoadmapTopic = {
 };
 type Roadmap = RoadmapTopic[];
 
+type RoadmapMessage = BaseMessage & {
+  type: "roadmap";
+  plan: Roadmap;
+  note?: string;
+};
+type ChatMessage = TextMessage | RoadmapMessage;
+
+type ContentItem = { type: string; content: string };
+
 /* =========================
    Config
 ========================= */
 const API_BASE = "https://retiform-leonida-stifledly.ngrok-free.dev";
+const ROADMAP_GET = (q: string) =>
+  `${API_BASE}/ask?q=${encodeURIComponent(q)}&_ngrok_skip_browser_warning=true`;
+const CHAT_POST = `${API_BASE}/general`;
 
 /* =========================
    Helpers
@@ -60,6 +74,35 @@ function tryExtractRoadmapFromText(text: string): Roadmap | null {
   } catch {
     return null;
   }
+}
+function stripRoadmapJsonFromText(text: string): string {
+  const first = text.indexOf("[");
+  const last = text.lastIndexOf("]");
+  if (first === -1 || last === -1 || last <= first) return text;
+  const before = text.slice(0, first).trim();
+  const after = text.slice(last + 1).trim();
+  return [before, after].filter(Boolean).join("\n\n").trim();
+}
+function roadmapLeadIn(plan: Roadmap): string {
+  const topics = plan.map((t) => t.name).slice(0, 6);
+  const tail = plan.length > 6 ? "…" : "";
+  return `I created a roadmap (${topics.join(
+    " → "
+  )}${tail}). Click a topic to explore subtopics.`;
+}
+function buildMetadata(messages: ChatMessage[], latestPlan?: Roadmap | null) {
+  return {
+    events: [],
+    roadmap: latestPlan ?? [],
+    messages: messages
+      .filter((m): m is TextMessage => m.type === "user" || m.type === "ai")
+      .map((m) => ({
+        id: m.id,
+        type: m.type,
+        content: (m as TextMessage).content,
+        timestamp: m.timestamp,
+      })),
+  };
 }
 
 /* =========================
@@ -104,79 +147,114 @@ function Header() {
 }
 
 /* =========================
-   Chat Messages
-========================= */
-function ChatMessages({
-  messages,
-  isTyping,
-}: {
-  messages: ChatMessage[];
-  isTyping: boolean;
-}) {
-  const endRef = useRef<HTMLDivElement | null>(null);
+   Learning Content (RIGHT PANEL)
+/* pulls /content/?q=... and shows above practice */
+function LearningContent({ query }: { query: string }) {
+  const [items, setItems] = useState<ContentItem[] | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
   useEffect(() => {
-    endRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages, isTyping]);
+    if (!query) return;
+    let alive = true;
+    (async () => {
+      setLoading(true);
+      setErr(null);
+      setItems(null);
+      try {
+        const url = `${API_BASE}/content/?q=${encodeURIComponent(
+          query
+        )}&_ngrok_skip_browser_warning=true`;
+        const res = await fetch(url, {
+          method: "GET",
+          mode: "cors",
+          headers: {
+            "ngrok-skip-browser-warning": "true",
+            Accept: "application/json,text/plain;q=0.9",
+            "Cache-Control": "no-cache",
+          },
+        });
+        const ct = res.headers.get("content-type") || "";
+        const bodyText = await res.text();
+        if (ct.includes("text/html") || bodyText.includes("ERR_NGROK_6024")) {
+          throw new Error("Ngrok splash intercepted the request.");
+        }
+        if (!res.ok) throw new Error(`Backend error ${res.status}`);
+        const parsed = JSON.parse(bodyText);
+        if (!Array.isArray(parsed))
+          throw new Error("Unexpected /content shape.");
+        if (alive) setItems(parsed as ContentItem[]);
+      } catch (e: any) {
+        if (alive) setErr(e?.message ?? "Failed to load content.");
+      } finally {
+        if (alive) setLoading(false);
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+  }, [query]);
+
+  if (loading) {
+    return (
+      <div className="rounded-xl border border-neutral-800 bg-neutral-900 p-4">
+        <div className="flex items-center gap-2 text-sm text-neutral-400">
+          <div className="h-2 w-2 rounded-full bg-neutral-500 animate-pulse" />
+          Loading study materials…
+        </div>
+      </div>
+    );
+  }
+
+  if (err) {
+    return (
+      <div className="rounded-xl border border-red-900/40 bg-red-950/40 p-4 text-sm text-red-300">
+        {err}
+      </div>
+    );
+  }
+
+  if (!items || items.length === 0) {
+    return (
+      <div className="rounded-xl border border-neutral-800 bg-neutral-900 p-4 text-sm text-neutral-400">
+        No study materials found for this topic.
+      </div>
+    );
+  }
 
   return (
-    <div className="space-y-6">
-      {messages.map((m) => (
-        <div key={m.id} className="flex">
-          {m.type === "ai" ? (
-            <div className="flex gap-3 w-full">
-              <div className="h-8 w-8 rounded-full bg-neutral-800 grid place-items-center flex-shrink-0">
-                <span className="text-orange-400 text-xs font-semibold">
-                  AI
-                </span>
-              </div>
-              <div className="flex-1 rounded-2xl bg-neutral-900 border border-neutral-800 px-4 py-3 leading-relaxed whitespace-pre-wrap">
-                {(() => {
-                  const roadmapMatch = tryExtractRoadmapFromText(m.content);
-                  if (roadmapMatch) {
-                    const first = m.content.indexOf("[");
-                    const last = m.content.lastIndexOf("]");
-                    if (first !== -1 && last !== -1 && last > first) {
-                      const beforeJson = m.content.slice(0, first).trim();
-                      const afterJson = m.content.slice(last + 1).trim();
-                      const cleanContent = [beforeJson, afterJson]
-                        .filter(Boolean)
-                        .join("\n\n")
-                        .trim();
-                      if (cleanContent) return cleanContent;
-                      return "I've created an interactive roadmap for you below. Click any topic circle to explore its subtopics.";
-                    }
-                  }
-                  return m.content;
-                })()}
-              </div>
-            </div>
-          ) : (
-            <div className="ml-auto max-w-[80%] rounded-2xl bg-orange-500 text-white px-4 py-3 leading-relaxed whitespace-pre-wrap">
-              {m.content}
-            </div>
-          )}
+    <div className="rounded-xl border border-neutral-800 bg-neutral-900 overflow-hidden">
+      <div className="px-4 py-3 border-b border-neutral-800 bg-neutral-900/60">
+        <div className="text-sm font-semibold text-neutral-100">
+          Study materials
         </div>
-      ))}
-      {isTyping && (
-        <div className="flex gap-3 items-center text-neutral-400">
-          <div className="h-2 w-2 rounded-full bg-neutral-500 animate-pulse" />
-          <div className="text-sm">AI is typing…</div>
-        </div>
-      )}
-      <div ref={endRef} />
+        <div className="text-xs text-neutral-500">{query}</div>
+      </div>
+      <div className="divide-y divide-neutral-800">
+        {items.map((it, idx) => (
+          <div key={idx} className="p-4 space-y-1.5">
+            <div className="text-[11px] uppercase tracking-wide text-neutral-400">
+              {it.type}
+            </div>
+            <div className="text-sm whitespace-pre-wrap text-neutral-200">
+              {it.content}
+            </div>
+          </div>
+        ))}
+      </div>
     </div>
   );
 }
 
 /* =========================
-   D3 Interactive Roadmap
+   D3 Roadmap (unchanged)
 ========================= */
 function InteractiveRoadmap({
   roadmap,
   onSubtopicClick,
 }: {
   roadmap: Roadmap;
-  onSubtopicClick: (topicName: string, subtopicName: string) => void;
+  onSubtopicClick: (topicName: string, subtopic: string) => void;
 }) {
   const wrapperRef = useRef<HTMLDivElement | null>(null);
   const svgRef = useRef<SVGSVGElement | null>(null);
@@ -240,7 +318,6 @@ function InteractiveRoadmap({
       .attr("fill", "#f97316");
 
     const g = svg.append("g");
-
     const zoom = d3
       .zoom<SVGSVGElement, unknown>()
       .scaleExtent([0.5, 2])
@@ -255,15 +332,9 @@ function InteractiveRoadmap({
       .attr("stroke", "#f97316")
       .attr("stroke-width", 2)
       .attr("marker-end", "url(#arrow)")
-      .attr("x1", (d) => {
-        const source = nodes.find((n) => n.id === d.source)!;
-        return source.x + 35;
-      })
+      .attr("x1", (d) => nodes.find((n) => n.id === d.source)!.x + 35)
       .attr("y1", (d) => nodes.find((n) => n.id === d.source)!.y)
-      .attr("x2", (d) => {
-        const target = nodes.find((n) => n.id === d.target)!;
-        return target.x - 35;
-      })
+      .attr("x2", (d) => nodes.find((n) => n.id === d.target)!.x - 35)
       .attr("y2", (d) => nodes.find((n) => n.id === d.target)!.y);
 
     const nodeGroup = g
@@ -284,12 +355,12 @@ function InteractiveRoadmap({
       .on("mouseover", function () {
         d3.select(this).attr("fill", "#f97316").attr("r", 38);
       })
-      .on("mouseout", function (_event, d: any) {
+      .on("mouseout", function (_e, d: any) {
         d3.select(this)
           .attr("fill", selectedTopic === d.index ? "#f97316" : "#111827")
           .attr("r", 35);
       })
-      .on("click", function (_event, d: any) {
+      .on("click", function (_e, d: any) {
         setSelectedTopic(selectedTopic === d.index ? null : d.index);
       });
 
@@ -304,17 +375,16 @@ function InteractiveRoadmap({
       .each(function (d: any) {
         const text = d3.select(this);
         const words = String(d.label).split(/\s+/);
-        if (words.length === 1 && d.label.length <= 12) {
-          text.text(d.label);
-        } else if (words.length <= 2) {
+        if (words.length === 1 && d.label.length <= 12) text.text(d.label);
+        else if (words.length <= 2) {
           text.selectAll("tspan").remove();
-          words.forEach((word: string, i: number) => {
+          words.forEach((word: string, i: number) =>
             text
               .append("tspan")
               .attr("x", 0)
               .attr("dy", i === 0 ? "-0.3em" : "1.2em")
-              .text(word.length > 10 ? word.slice(0, 8) + "..." : word);
-          });
+              .text(word.length > 10 ? word.slice(0, 8) + "..." : word)
+          );
         } else {
           text.text(
             words[0].length > 8
@@ -328,33 +398,30 @@ function InteractiveRoadmap({
       nodes.length > 0 ? Math.max(...nodes.map((n) => n.x)) + 100 : width;
     if (totalWidth > width) {
       svg.attr("viewBox", `0 0 ${totalWidth} ${height}`);
-      let isScrolling = false;
-      let startX = 0;
-      let scrollLeft = 0;
-
-      const handleStart = (clientX: number) => {
+      let isScrolling = false,
+        startX = 0,
+        scrollLeft = 0;
+      const handleStart = (x: number) => {
         isScrolling = true;
-        startX = clientX;
-        const viewBox = (svg.attr("viewBox") || "0 0 0 0").split(" ");
-        scrollLeft = parseFloat(viewBox[0]);
+        startX = x;
+        scrollLeft = parseFloat(
+          (svg.attr("viewBox") || "0 0 0 0").split(" ")[0]
+        );
         svg.style("cursor", "grabbing");
       };
-
-      const handleMove = (clientX: number) => {
+      const handleMove = (x: number) => {
         if (!isScrolling) return;
-        const walk = (clientX - startX) * 2;
-        const newScrollLeft = Math.max(
+        const walk = (x - startX) * 2;
+        const newLeft = Math.max(
           0,
           Math.min(totalWidth - width, scrollLeft - walk)
         );
-        svg.attr("viewBox", `${newScrollLeft} 0 ${width} ${height}`);
+        svg.attr("viewBox", `${newLeft} 0 ${width} ${height}`);
       };
-
       const handleEnd = () => {
         isScrolling = false;
         svg.style("cursor", "grab");
       };
-
       svg
         .style("cursor", "grab")
         .on("mousedown", (e: any) => handleStart(e.clientX))
@@ -366,8 +433,7 @@ function InteractiveRoadmap({
     }
 
     const onResize = () => {
-      const w = wrapper.clientWidth;
-      svg.attr("viewBox", `0 0 ${w} ${height}`);
+      svg.attr("viewBox", `0 0 ${wrapper.clientWidth} ${height}`);
     };
     window.addEventListener("resize", onResize);
     return () => window.removeEventListener("resize", onResize);
@@ -423,6 +489,80 @@ function InteractiveRoadmap({
 }
 
 /* =========================
+   Chat Messages (supports roadmap)
+========================= */
+function ChatMessages({
+  messages,
+  isTyping,
+  onSubtopicClick,
+}: {
+  messages: ChatMessage[];
+  isTyping: boolean;
+  onSubtopicClick: (topic: string, subtopic: string) => void;
+}) {
+  const endRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    endRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages, isTyping]);
+
+  return (
+    <div className="space-y-6">
+      {messages.map((m) => {
+        if (m.type === "roadmap") {
+          const rm = m as RoadmapMessage;
+          return (
+            <div key={m.id} className="space-y-2">
+              {rm.note && (
+                <div className="flex gap-3 w-full">
+                  <div className="h-8 w-8 rounded-full bg-neutral-800 grid place-items-center flex-shrink-0">
+                    <span className="text-orange-400 text-xs font-semibold">
+                      AI
+                    </span>
+                  </div>
+                  <div className="flex-1 rounded-2xl bg-neutral-900 border border-neutral-800 px-4 py-3 leading-relaxed whitespace-pre-wrap">
+                    {rm.note}
+                  </div>
+                </div>
+              )}
+              <InteractiveRoadmap
+                roadmap={rm.plan}
+                onSubtopicClick={onSubtopicClick}
+              />
+            </div>
+          );
+        }
+
+        const tm = m as TextMessage;
+        return tm.type === "ai" ? (
+          <div key={m.id} className="flex gap-3 w-full">
+            <div className="h-8 w-8 rounded-full bg-neutral-800 grid place-items-center flex-shrink-0">
+              <span className="text-orange-400 text-xs font-semibold">AI</span>
+            </div>
+            <div className="flex-1 rounded-2xl bg-neutral-900 border border-neutral-800 px-4 py-3 leading-relaxed whitespace-pre-wrap">
+              {tm.content}
+            </div>
+          </div>
+        ) : (
+          <div
+            key={m.id}
+            className="ml-auto max-w-[80%] rounded-2xl bg-orange-500 text-white px-4 py-3 leading-relaxed whitespace-pre-wrap"
+          >
+            {tm.content}
+          </div>
+        );
+      })}
+      {isTyping && (
+        <div className="flex gap-3 items-center text-neutral-400">
+          <div className="h-2 w-2 rounded-full bg-neutral-500 animate-pulse" />
+          <div className="text-sm">AI is typing…</div>
+        </div>
+      )}
+      <div ref={endRef} />
+    </div>
+  );
+}
+
+/* =========================
    Chat Input
 ========================= */
 function ChatInput({
@@ -433,7 +573,7 @@ function ChatInput({
 }: {
   currentMessage: string;
   setCurrentMessage: (message: string) => void;
-  onSend: () => void;
+  onSend: (text: string) => void;
   disabled: boolean;
 }) {
   return (
@@ -448,18 +588,23 @@ function ChatInput({
           onKeyDown={(e) => {
             if (e.key === "Enter" && !e.shiftKey) {
               e.preventDefault();
-              onSend();
+              const text = currentMessage.trim();
+              if (text) onSend(text);
             }
           }}
         />
         <div className="flex items-center justify-end px-2 pb-2">
           <button
-            onClick={onSend}
+            onClick={() => {
+              const text = currentMessage.trim();
+              if (text) onSend(text);
+            }}
             disabled={disabled}
-            className={`inline-flex items-center gap-2 rounded-lg px-3 py-2 text-sm font-medium ${!disabled
+            className={`inline-flex items-center gap-2 rounded-lg px-3 py-2 text-sm font-medium ${
+              !disabled
                 ? "bg-orange-500 text-white hover:bg-orange-600"
                 : "bg-neutral-800 text-neutral-500 cursor-not-allowed"
-              }`}
+            }`}
           >
             <Send size={16} />
             Send
@@ -467,7 +612,7 @@ function ChatInput({
         </div>
       </div>
       <p className="text-[11px] text-neutral-500 mt-2 text-center">
-        Ask for learning roadmaps and I'll create interactive visualizations for
+        Ask for learning roadmaps and I’ll create interactive visualizations for
         you
       </p>
     </div>
@@ -478,9 +623,8 @@ function ChatInput({
    Main Page (Chat by ID)
 ========================= */
 export default function ChatByIdPage() {
-  // read id from route
   const params = useParams<{ id: string }>();
-  const routeChatId = params?.id ?? null;
+  const chatId = params?.id ?? null;
 
   const [currentMessage, setCurrentMessage] = useState("");
   const [isTyping, setIsTyping] = useState(false);
@@ -491,27 +635,23 @@ export default function ChatByIdPage() {
       content:
         "Hi! I'm your learning copilot. Ask anything.\nTip: Ask for a roadmap in JSON (TOPIC/SUBTOPIC) and I'll render it as an interactive graph.",
       timestamp: Date.now(),
-    },
+    } as TextMessage,
   ]);
-  const [roadmap, setRoadmap] = useState<Roadmap | null>(null);
+
   const [selectedLearningTopic, setSelectedLearningTopic] = useState<{
     topicName: string;
     subtopicName: string;
   } | null>(null);
 
-  const [chatId, setChatId] = useState<string | null>(null);
-  const [pathwaySaved, setPathwaySaved] = useState(false);
+  // Dynamic practice state (Gemini)
+  const [practiceLoading, setPracticeLoading] = useState(false);
+  const [practiceErr, setPracticeErr] = useState<string | null>(null);
+  const [genMcqs, setGenMcqs] = useState<GeneratedMCQ[]>([]);
+  const [genTexts, setGenTexts] = useState<GeneratedTextQ[]>([]);
 
-  // bind chatId from route
-  useEffect(() => {
-    if (routeChatId) setChatId(routeChatId);
-  }, [routeChatId]);
-
-  async function callBackend(q: string): Promise<string> {
-    const url = `${API_BASE}/ask?q=${encodeURIComponent(
-      q
-    )}&_ngrok_skip_browser_warning=true`;
-    const res = await fetch(url, {
+  // --- helpers for HTTP ---
+  async function getAskRaw(query: string): Promise<string> {
+    const res = await fetch(ROADMAP_GET(query), {
       method: "GET",
       headers: {
         "ngrok-skip-browser-warning": "true",
@@ -520,80 +660,206 @@ export default function ChatByIdPage() {
       },
       mode: "cors",
     });
-    const ct = res.headers.get("content-type") || "";
     const text = await res.text();
+    const ct = res.headers.get("content-type") || "";
     if (ct.includes("text/html") || text.includes("ERR_NGROK_6024")) {
       throw new Error("Ngrok splash intercepted the request.");
     }
-    if (!res.ok) throw new Error(`Backend error ${res.status}`);
+    if (!res.ok) {
+      throw new Error(`Backend error ${res.status}: ${text.substring(0, 200)}`);
+    }
     return text;
   }
 
-  async function handleSend() {
-    const content = currentMessage.trim();
-    if (!content || !chatId) return;
+  async function postJSON<T = any>(url: string, body: unknown): Promise<T> {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: {
+        "ngrok-skip-browser-warning": "true",
+        Accept: "application/json,text/plain;q=0.9",
+        "Content-Type": "application/json",
+        "Cache-Control": "no-cache",
+      },
+      mode: "cors",
+      body: JSON.stringify(body),
+    });
+    const text = await res.text();
+    const ct = res.headers.get("content-type") || "";
+    if (ct.includes("text/html") || text.includes("ERR_NGROK_6024")) {
+      throw new Error("Ngrok splash intercepted the request.");
+    }
+    if (!res.ok) {
+      throw new Error(`Backend error ${res.status}: ${text.substring(0, 200)}`);
+    }
+    try {
+      return JSON.parse(text);
+    } catch {
+      return text as any;
+    }
+  }
 
-    const userMsg: ChatMessage = {
+  // --- send handler (unchanged routing) ---
+  async function handleSend(text: string) {
+    if (!chatId) return;
+    setCurrentMessage("");
+
+    const userMsg: TextMessage = {
       id: crypto.randomUUID(),
       type: "user",
-      content,
+      content: text,
       timestamp: Date.now(),
     };
 
-    // local UI
-    setMessages((m) => [...m, userMsg]);
-    setCurrentMessage("");
+    let afterUser: ChatMessage[] = [];
+    setMessages((prev) => (afterUser = [...prev, userMsg]));
+
     setIsTyping(true);
-
     try {
-      const reply = await callBackend(content);
-      const aiMsg: ChatMessage = {
-        id: crypto.randomUUID(),
-        type: "ai",
-        content: reply,
-        timestamp: Date.now(),
-      };
-      const newMessages = [...messages, userMsg, aiMsg];
-      setMessages(newMessages);
+      const verdict = await classifyPrompt(text);
 
-      const plan = tryExtractRoadmapFromText(reply);
-      setRoadmap(plan ?? null);
+      let finalArray: ChatMessage[] = afterUser;
+      let latestPlan: Roadmap | null = null;
 
-      // persist snapshot
+      if (verdict.type === "roadmap") {
+        const raw = await getAskRaw(text);
+        const plan = tryExtractRoadmapFromText(raw);
+
+        if (!plan) {
+          const fallbackAI: TextMessage = {
+            id: crypto.randomUUID(),
+            type: "ai",
+            content: raw,
+            timestamp: Date.now(),
+          };
+          setMessages((prev) => (finalArray = [...prev, fallbackAI]));
+        } else {
+          latestPlan = plan;
+
+          const lead: TextMessage = {
+            id: crypto.randomUUID(),
+            type: "ai",
+            content: roadmapLeadIn(plan),
+            timestamp: Date.now(),
+          };
+          const road: RoadmapMessage = {
+            id: crypto.randomUUID(),
+            type: "roadmap",
+            plan,
+            timestamp: Date.now(),
+          };
+          setMessages((prev) => (finalArray = [...prev, lead, road]));
+
+          await savePlanAsPathway({
+            plan,
+            title: "Learning Path",
+            chatId,
+            status: "ACTIVE",
+          });
+        }
+      } else {
+        const metadata = buildMetadata(afterUser, null);
+        const result = await postJSON<any>(CHAT_POST, {
+          metadata,
+          query: text,
+        });
+
+        const raw =
+          typeof result === "string"
+            ? result
+            : result?.text ?? JSON.stringify(result);
+        const possiblePlan = tryExtractRoadmapFromText(raw);
+        const cleaned = stripRoadmapJsonFromText(raw);
+
+        const aiText: TextMessage = {
+          id: crypto.randomUUID(),
+          type: "ai",
+          content: cleaned || raw,
+          timestamp: Date.now(),
+        };
+        setMessages((prev) => (finalArray = [...prev, aiText]));
+
+        if (possiblePlan) {
+          latestPlan = possiblePlan;
+          const road: RoadmapMessage = {
+            id: crypto.randomUUID(),
+            type: "roadmap",
+            plan: possiblePlan,
+            note: roadmapLeadIn(possiblePlan),
+            timestamp: Date.now(),
+          };
+          setMessages((prev) => (finalArray = [...prev, road]));
+          await savePlanAsPathway({
+            plan: possiblePlan,
+            title: "Learning Path",
+            chatId,
+            status: "ACTIVE",
+          });
+        }
+      }
+
       await saveChatSnapshot({
         chatId,
-        messages: newMessages,
-        roadmap: plan ?? null,
-        titleFallback: messages.length <= 2 ? content.slice(0, 60) : null,
+        messages: finalArray.filter(
+          (m): m is TextMessage => m.type === "user" || m.type === "ai"
+        ),
+        roadmap: latestPlan ?? null,
+        titleFallback: afterUser.length <= 2 ? text.slice(0, 60) : null,
       });
-
-      // save pathway once
-      if (plan && !pathwaySaved) {
-        const saved = await savePlanAsPathway({
-          plan,
-          title: "Learning Path",
-          chatId,
-          status: "ACTIVE",
-        });
-        if (saved?.ok) setPathwaySaved(true);
-      }
     } catch (e: any) {
-      const errMsg = `Could not reach server: ${e?.message ?? "Unknown error"}`;
-      const aiErr: ChatMessage = {
+      const aiErr: TextMessage = {
         id: crypto.randomUUID(),
         type: "ai",
-        content: errMsg,
+        content: `Could not reach server:\n\n${e?.message ?? "Unknown error"}`,
         timestamp: Date.now(),
       };
-      const newMessages = [...messages, userMsg, aiErr];
-      setMessages(newMessages);
-      if (chatId) {
-        await saveChatSnapshot({ chatId, messages: newMessages, roadmap });
-      }
+      setMessages((prev) => [...prev, aiErr]);
+      await saveChatSnapshot({
+        chatId,
+        messages: [...messages, userMsg, aiErr].filter(
+          (m): m is TextMessage => m.type === "user" || m.type === "ai"
+        ),
+      });
     } finally {
       setIsTyping(false);
     }
   }
+
+  // Generate practice whenever a subtopic is selected (and we have a roadmap)
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      if (!selectedLearningTopic) return;
+      // find the latest roadmap in the chat to pass as context
+      const latestRoadmap = [...messages]
+        .reverse()
+        .find((m): m is RoadmapMessage => m.type === "roadmap")?.plan;
+
+      setPracticeLoading(true);
+      setPracticeErr(null);
+      setGenMcqs([]);
+      setGenTexts([]);
+      try {
+        const res = await generatePractice({
+          topic: selectedLearningTopic.topicName,
+          subtopic: selectedLearningTopic.subtopicName,
+          roadmap: latestRoadmap ?? [],
+          numMcqs: 3,
+          numTexts: 2,
+        });
+        if (!alive) return;
+        setGenMcqs(res.mcqs || []);
+        setGenTexts(res.texts || []);
+      } catch (e: any) {
+        if (!alive) return;
+        setPracticeErr(e?.message ?? "Failed to generate practice.");
+      } finally {
+        if (alive) setPracticeLoading(false);
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+  }, [selectedLearningTopic, messages]);
 
   function handleSubtopicClick(topicName: string, subtopicName: string) {
     setSelectedLearningTopic({ topicName, subtopicName });
@@ -609,32 +875,22 @@ export default function ChatByIdPage() {
       <Header />
 
       <div className="flex-1 flex overflow-hidden">
-        {/* Chat Section */}
+        {/* Left: Chat */}
         <div
-          className={`${isLearningMode ? "w-1/2" : "w-full"
-            } flex flex-col transition-all duration-300`}
+          className={`${
+            isLearningMode ? "w-1/2" : "w-full"
+          } flex flex-col transition-all duration-300`}
         >
           <main
-            className={`flex-1 overflow-y-auto ${isLearningMode ? "max-w-none" : "mx-auto max-w-3xl"
-              } px-4 py-6 space-y-6`}
+            className={`flex-1 overflow-y-auto ${
+              isLearningMode ? "max-w-none" : "mx-auto max-w-3xl"
+            } px-4 py-6 space-y-6`}
           >
-            <ChatMessages messages={messages} isTyping={isTyping} />
-
-            {/* Interactive Roadmap */}
-            {roadmap && (
-              <div className="space-y-4">
-                <div className="flex items-center gap-3 px-1">
-                  <div className="w-2 h-2 bg-orange-500 rounded-full animate-pulse" />
-                  <span className="text-sm font-medium text-neutral-200">
-                    Learning Roadmap
-                  </span>
-                </div>
-                <InteractiveRoadmap
-                  roadmap={roadmap}
-                  onSubtopicClick={handleSubtopicClick}
-                />
-              </div>
-            )}
+            <ChatMessages
+              messages={messages}
+              isTyping={isTyping}
+              onSubtopicClick={handleSubtopicClick}
+            />
           </main>
 
           <ChatInput
@@ -645,19 +901,12 @@ export default function ChatByIdPage() {
           />
         </div>
 
-        {/* Right Panel */}
+        {/* Right: Practice Panel WITH /content + Gemini-generated practice */}
         {isLearningMode && selectedLearningTopic && (
           <div className="w-1/2 h-full overflow-y-auto border-l border-neutral-800 p-4 space-y-4">
-            {/* You can also render your old LearningContent here if you want */}
-            {/* <LearningContent
-              topicName={selectedLearningTopic.topicName}
-              subtopicName={selectedLearningTopic.subtopicName}
-              onClose={closeLearningContent}
-            /> */}
-
             <div className="flex items-center justify-between">
               <h3 className="font-semibold text-neutral-200">
-                Practice: {selectedLearningTopic.subtopicName}
+                {selectedLearningTopic.subtopicName}
               </h3>
               <button
                 onClick={closeLearningContent}
@@ -667,26 +916,67 @@ export default function ChatByIdPage() {
               </button>
             </div>
 
-            <MCQCard
-              question={`Which statement about ${selectedLearningTopic.subtopicName} is true?`}
-              options={[
-                "It is unrelated to React rendering.",
-                `It helps organize ${selectedLearningTopic.subtopicName} for maintainability.`,
-                "It always slows down performance.",
-                "It cannot be used with TypeScript.",
-              ]}
-              correctIndex={1}
-            />
+            {/* Study content pulled from /content API (above practice) */}
+            <LearningContent query={selectedLearningTopic.subtopicName} />
 
-            <TextAnswerCard
-              prompt={`In 3–5 sentences, explain how you would apply ${selectedLearningTopic.subtopicName} within ${selectedLearningTopic.topicName} and mention one common pitfall to avoid.`}
-              context={`Topic: ${selectedLearningTopic.topicName}. Subtopic: ${selectedLearningTopic.subtopicName}. Audience: beginner.`}
-            />
-            {/* Floating YouTube Recommendations */}
-            {selectedLearningTopic && (
-              <YoutubeRecs topic={selectedLearningTopic.subtopicName} />
+            {/* Gemini-generated practice */}
+            {practiceLoading && (
+              <div className="rounded-xl border border-neutral-800 bg-neutral-900 p-4 text-sm text-neutral-300">
+                Generating practice…
+              </div>
+            )}
+            {practiceErr && (
+              <div className="rounded-xl border border-red-900/40 bg-red-950/40 p-4 text-sm text-red-300">
+                {practiceErr}
+              </div>
             )}
 
+            {/* MCQs */}
+            {(genMcqs.length
+              ? genMcqs
+              : [
+                  // Fallback MCQ if Gemini returns nothing
+                  {
+                    question: `Which statement about ${selectedLearningTopic.subtopicName} is true?`,
+                    options: [
+                      "It is unrelated to React rendering.",
+                      `It helps organize ${selectedLearningTopic.subtopicName} for maintainability.`,
+                      "It always slows down performance.",
+                      "It cannot be used with TypeScript.",
+                    ],
+                    correctIndex: 1,
+                  },
+                ]
+            ).map((q, idx) => (
+              <MCQCard
+                key={`mcq-${idx}`}
+                question={q.question}
+                options={q.options}
+                correctIndex={q.correctIndex}
+                explanation={q.explanation}
+              />
+            ))}
+
+            {/* Short-answer prompts */}
+            {(genTexts.length
+              ? genTexts
+              : [
+                  // Fallback text prompt
+                  {
+                    prompt: `In 3–5 sentences, explain how you would apply ${selectedLearningTopic.subtopicName} within ${selectedLearningTopic.topicName} and mention one common pitfall to avoid.`,
+                    context: `Topic: ${selectedLearningTopic.topicName}. Subtopic: ${selectedLearningTopic.subtopicName}. Audience: beginner.`,
+                  },
+                ]
+            ).map((t, idx) => (
+              <TextAnswerCard
+                key={`textq-${idx}`}
+                prompt={t.prompt}
+                context={t.context}
+              />
+            ))}
+
+            {/* Optional: YouTube */}
+            <YoutubeRecs topic={selectedLearningTopic.subtopicName} />
           </div>
         )}
       </div>

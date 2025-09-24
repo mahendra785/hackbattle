@@ -141,7 +141,7 @@ model Chat {
   meta Json? // model hints, UI prefs, etc.
 
   // Each chat can have its own pathway snapshot (1:1 via Pathway.chatId)
-  pathway Pathway?
+  pathway Pathway[]
 
   // Quick resume pointer
   lastNodeId String?
@@ -162,7 +162,7 @@ model Pathway {
   user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   // If this is a per-chat snapshot: one pathway per chat
-  chatId String? @unique
+  chatId String?
   chat   Chat?   @relation(fields: [chatId], references: [id], onDelete: Cascade)
 
   userSubjectId String?
@@ -185,6 +185,7 @@ model Pathway {
   @@index([userId, status])
   @@index([userSubjectId])
   @@index([deletedAt])
+  @@index([chatId])
 }
 
 model PathNode {
