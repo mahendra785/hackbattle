@@ -1,6 +1,6 @@
 "use server";
 
-import { auth, signIn } from "../auth";
+import { auth, signIn } from "../../app/api/auth/auth";
 
 export default async function SignIn() {
   const session = await auth();
