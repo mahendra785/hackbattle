@@ -10,6 +10,8 @@ import { savePlanAsPathway } from "@/app/actions/pathway";
 import { useParams } from "next/navigation";
 import MCQCard from "../../../components/mcq";
 import TextAnswerCard from "../../../components/Text";
+import YoutubeRecs from "../../../components/YoutubeRecs";
+
 
 /* =========================
    Types
@@ -454,11 +456,10 @@ function ChatInput({
           <button
             onClick={onSend}
             disabled={disabled}
-            className={`inline-flex items-center gap-2 rounded-lg px-3 py-2 text-sm font-medium ${
-              !disabled
+            className={`inline-flex items-center gap-2 rounded-lg px-3 py-2 text-sm font-medium ${!disabled
                 ? "bg-orange-500 text-white hover:bg-orange-600"
                 : "bg-neutral-800 text-neutral-500 cursor-not-allowed"
-            }`}
+              }`}
           >
             <Send size={16} />
             Send
@@ -610,14 +611,12 @@ export default function ChatByIdPage() {
       <div className="flex-1 flex overflow-hidden">
         {/* Chat Section */}
         <div
-          className={`${
-            isLearningMode ? "w-1/2" : "w-full"
-          } flex flex-col transition-all duration-300`}
+          className={`${isLearningMode ? "w-1/2" : "w-full"
+            } flex flex-col transition-all duration-300`}
         >
           <main
-            className={`flex-1 overflow-y-auto ${
-              isLearningMode ? "max-w-none" : "mx-auto max-w-3xl"
-            } px-4 py-6 space-y-6`}
+            className={`flex-1 overflow-y-auto ${isLearningMode ? "max-w-none" : "mx-auto max-w-3xl"
+              } px-4 py-6 space-y-6`}
           >
             <ChatMessages messages={messages} isTyping={isTyping} />
 
@@ -683,6 +682,11 @@ export default function ChatByIdPage() {
               prompt={`In 3–5 sentences, explain how you would apply ${selectedLearningTopic.subtopicName} within ${selectedLearningTopic.topicName} and mention one common pitfall to avoid.`}
               context={`Topic: ${selectedLearningTopic.topicName}. Subtopic: ${selectedLearningTopic.subtopicName}. Audience: beginner.`}
             />
+            {/* Floating YouTube Recommendations */}
+            {selectedLearningTopic && (
+              <YoutubeRecs topic={selectedLearningTopic.subtopicName} />
+            )}
+
           </div>
         )}
       </div>

@@ -6,10 +6,23 @@ export default function Chatwindow() {
     { role: "system", text: "Welcome! Let’s start your learning journey." },
   ]);
   const [input, setInput] = useState("");
+  const [videos, setVideos] = useState<any[]>([]); // store recommended videos
 
-  const handleSend = () => {
+  const handleSend = async () => {
     if (!input.trim()) return;
     setMessages([...messages, { role: "user", text: input }]);
+
+    // Call YouTube API for recommendations
+    try {
+      const res = await fetch(
+        `/api/youtube?q=${encodeURIComponent(input)}`
+      );
+      const data = await res.json();
+      setVideos(data.items || []);
+    } catch (err) {
+      console.error("YT fetch error:", err);
+    }
+
     setInput("");
   };
 
@@ -28,6 +41,26 @@ export default function Chatwindow() {
             {msg.text}
           </div>
         ))}
+
+        {/* YouTube Recommendations */}
+        {videos.length > 0 && (
+          <div className="mt-4">
+            <h3 className="font-semibold mb-2">🎥 Recommended Videos</h3>
+            <div className="space-y-2">
+              {videos.slice(0, 3).map((video, idx) => (
+                <a
+                  key={idx}
+                  href={`https://www.youtube.com/watch?v=${video.id.videoId}`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="block text-blue-600 underline"
+                >
+                  {video.snippet.title}
+                </a>
+              ))}
+            </div>
+          </div>
+        )}
       </div>
 
       <div className="flex">
