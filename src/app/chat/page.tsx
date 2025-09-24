@@ -1,9 +1,15 @@
+// src/app/page.tsx
 "use client";
 
 import Image from "next/image";
 import { useEffect, useMemo, useRef, useState } from "react";
 import * as d3 from "d3";
 import { Send, BookOpen, Play, FileText, ExternalLink } from "lucide-react";
+import { useSession } from "next-auth/react";
+import { createChat, saveChatSnapshot } from "@/app/actions/chat";
+import { savePlanAsPathway } from "@/app/actions/pathway";
+import MCQCard from "../../components/mcq";
+import TextAnswerCard from "../../components/Text";
 
 /* =========================
    Types
@@ -48,6 +54,7 @@ function tryExtractRoadmapFromText(text: string): Roadmap | null {
           (s: any) => s?.type === "SUBTOPIC" && typeof s.name === "string"
         )
     );
+
     return ok ? (parsed as Roadmap) : null;
   } catch {
     return null;
@@ -57,9 +64,8 @@ function tryExtractRoadmapFromText(text: string): Roadmap | null {
 /* =========================
    Header Component
 ========================= */
-import { useSession } from "next-auth/react";
 function Header() {
-  const { data: session, status } = useSession();
+  const { data: session } = useSession();
   return (
     <header className="sticky top-0 z-10 border-b border-neutral-900 bg-neutral-950/80 backdrop-blur">
       <div className="mx-auto max-w-6xl px-4 py-3 flex items-center justify-between">
@@ -168,7 +174,7 @@ function ChatMessages({
 }
 
 /* =========================
-   D3 Interactive Roadmap Component
+   D3 Interactive Roadmap
 ========================= */
 function InteractiveRoadmap({
   roadmap,
@@ -208,7 +214,6 @@ function InteractiveRoadmap({
         y: centerY,
       });
 
-      // Connect topics in sequence
       if (i > 0) {
         l.push({ source: `topic_${i - 1}`, target: topicId });
       }
@@ -254,7 +259,7 @@ function InteractiveRoadmap({
 
     const g = svg.append("g");
 
-    // Zoom behavior
+    // Zoom
     const zoom = d3
       .zoom<SVGSVGElement, unknown>()
       .scaleExtent([0.5, 2])
@@ -272,12 +277,12 @@ function InteractiveRoadmap({
       .attr("marker-end", "url(#arrow)")
       .attr("x1", (d) => {
         const source = nodes.find((n) => n.id === d.source)!;
-        return source.x + 35; // radius + some padding
+        return source.x + 35;
       })
       .attr("y1", (d) => nodes.find((n) => n.id === d.source)!.y)
       .attr("x2", (d) => {
         const target = nodes.find((n) => n.id === d.target)!;
-        return target.x - 35; // radius + some padding
+        return target.x - 35;
       })
       .attr("y2", (d) => nodes.find((n) => n.id === d.target)!.y);
 
@@ -298,19 +303,19 @@ function InteractiveRoadmap({
       .attr("stroke", "#f97316")
       .attr("stroke-width", 2)
       .style("cursor", "pointer")
-      .on("mouseover", function (event, d) {
+      .on("mouseover", function (_event, d: any) {
         d3.select(this).attr("fill", "#f97316").attr("r", 38);
       })
-      .on("mouseout", function (event, d) {
+      .on("mouseout", function (_event, d: any) {
         d3.select(this)
           .attr("fill", selectedTopic === d.index ? "#f97316" : "#111827")
           .attr("r", 35);
       })
-      .on("click", function (event, d) {
+      .on("click", function (_event, d: any) {
         setSelectedTopic(selectedTopic === d.index ? null : d.index);
       });
 
-    // Text labels
+    // Labels
     nodeGroup
       .append("text")
       .attr("text-anchor", "middle")
@@ -319,17 +324,15 @@ function InteractiveRoadmap({
       .attr("fill", "#ffffff")
       .attr("font-weight", "500")
       .style("pointer-events", "none")
-      .each(function (d) {
+      .each(function (d: any) {
         const text = d3.select(this);
-        const words = d.label.split(/\s+/);
+        const words = String(d.label).split(/\s+/);
 
         if (words.length === 1 && d.label.length <= 12) {
-          // Single word, short enough
           text.text(d.label);
         } else if (words.length <= 2) {
-          // Two words or less
           text.selectAll("tspan").remove();
-          words.forEach((word, i) => {
+          words.forEach((word: string, i: number) => {
             text
               .append("tspan")
               .attr("x", 0)
@@ -337,7 +340,6 @@ function InteractiveRoadmap({
               .text(word.length > 10 ? word.slice(0, 8) + "..." : word);
           });
         } else {
-          // Multiple words - show first word + "..."
           text.text(
             words[0].length > 8
               ? words[0].slice(0, 6) + "..."
@@ -346,14 +348,11 @@ function InteractiveRoadmap({
         }
       });
 
-    // Auto-center the view with horizontal scrolling
+    // Horizontal scrolling if needed
     const totalWidth =
       nodes.length > 0 ? Math.max(...nodes.map((n) => n.x)) + 100 : width;
     if (totalWidth > width) {
-      // Enable horizontal scrolling by setting a larger viewBox width
       svg.attr("viewBox", `0 0 ${totalWidth} ${height}`);
-
-      // Add scroll functionality
       let isScrolling = false;
       let startX = 0;
       let scrollLeft = 0;
@@ -361,15 +360,14 @@ function InteractiveRoadmap({
       const handleStart = (clientX: number) => {
         isScrolling = true;
         startX = clientX;
-        const viewBox = svg.attr("viewBox").split(" ");
+        const viewBox = (svg.attr("viewBox") || "0 0 0 0").split(" ");
         scrollLeft = parseFloat(viewBox[0]);
         svg.style("cursor", "grabbing");
       };
 
       const handleMove = (clientX: number) => {
         if (!isScrolling) return;
-        const x = clientX;
-        const walk = (x - startX) * 2; // Scroll speed
+        const walk = (clientX - startX) * 2;
         const newScrollLeft = Math.max(
           0,
           Math.min(totalWidth - width, scrollLeft - walk)
@@ -384,15 +382,15 @@ function InteractiveRoadmap({
 
       svg
         .style("cursor", "grab")
-        .on("mousedown", (e) => handleStart(e.clientX))
-        .on("mousemove", (e) => handleMove(e.clientX))
+        .on("mousedown", (e: any) => handleStart(e.clientX))
+        .on("mousemove", (e: any) => handleMove(e.clientX))
         .on("mouseup", handleEnd)
         .on("mouseleave", handleEnd);
     } else {
       svg.attr("viewBox", `0 0 ${width} ${height}`);
     }
 
-    // Handle resize
+    // Resize
     const onResize = () => {
       const w = wrapper.clientWidth;
       svg.attr("viewBox", `0 0 ${w} ${height}`);
@@ -408,7 +406,6 @@ function InteractiveRoadmap({
         className="w-full h-48 overflow-hidden rounded-xl border border-neutral-800 bg-gradient-to-br from-neutral-900 to-neutral-950 shadow-lg"
       />
 
-      {/* Subtopics panel */}
       {selectedTopic !== null && roadmap[selectedTopic] && (
         <div className="rounded-xl border border-orange-500/20 bg-gradient-to-br from-neutral-900 to-neutral-950 shadow-lg overflow-hidden">
           <div className="bg-gradient-to-r from-orange-500/10 to-transparent p-4 border-b border-orange-500/20">
@@ -453,7 +450,7 @@ function InteractiveRoadmap({
 }
 
 /* =========================
-   Learning Content Component
+   Learning Content Panel
 ========================= */
 function LearningContent({
   topicName,
@@ -485,7 +482,6 @@ function LearningContent({
 
       {/* Content */}
       <div className="flex-1 overflow-y-auto p-4 space-y-6">
-        {/* Overview Card */}
         <div className="bg-neutral-800/50 rounded-lg p-4">
           <div className="flex items-center gap-2 mb-3">
             <BookOpen size={16} className="text-orange-400" />
@@ -500,33 +496,26 @@ function LearningContent({
           </p>
         </div>
 
-        {/* Quick Start */}
         <div className="bg-neutral-800/50 rounded-lg p-4">
           <div className="flex items-center gap-2 mb-3">
             <Play size={16} className="text-green-400" />
             <h3 className="font-medium text-neutral-200">Quick Start</h3>
           </div>
           <ul className="space-y-2 text-sm text-neutral-400">
-            <li className="flex items-start gap-2">
-              <div className="w-1 h-1 bg-green-400 rounded-full mt-2 flex-shrink-0"></div>
-              <span>Understand the core principles of {subtopicName}</span>
-            </li>
-            <li className="flex items-start gap-2">
-              <div className="w-1 h-1 bg-green-400 rounded-full mt-2 flex-shrink-0"></div>
-              <span>Learn practical applications and use cases</span>
-            </li>
-            <li className="flex items-start gap-2">
-              <div className="w-1 h-1 bg-green-400 rounded-full mt-2 flex-shrink-0"></div>
-              <span>Practice with hands-on examples</span>
-            </li>
-            <li className="flex items-start gap-2">
-              <div className="w-1 h-1 bg-green-400 rounded-full mt-2 flex-shrink-0"></div>
-              <span>Test your understanding with exercises</span>
-            </li>
+            {[
+              `Understand the core principles of ${subtopicName}`,
+              "Learn practical applications and use cases",
+              "Practice with hands-on examples",
+              "Test your understanding with exercises",
+            ].map((t, i) => (
+              <li key={i} className="flex items-start gap-2">
+                <div className="w-1 h-1 bg-green-400 rounded-full mt-2 flex-shrink-0"></div>
+                <span>{t}</span>
+              </li>
+            ))}
           </ul>
         </div>
 
-        {/* Key Concepts */}
         <div className="bg-neutral-800/50 rounded-lg p-4">
           <div className="flex items-center gap-2 mb-3">
             <FileText size={16} className="text-blue-400" />
@@ -550,7 +539,6 @@ function LearningContent({
           </div>
         </div>
 
-        {/* Resources */}
         <div className="bg-neutral-800/50 rounded-lg p-4">
           <div className="flex items-center gap-2 mb-3">
             <ExternalLink size={16} className="text-purple-400" />
@@ -576,7 +564,6 @@ function LearningContent({
           </div>
         </div>
 
-        {/* Coming Soon Notice */}
         <div className="bg-gradient-to-r from-orange-500/10 to-purple-500/10 rounded-lg p-4 border border-orange-500/20">
           <div className="text-center">
             <div className="text-orange-400 font-medium mb-1">
@@ -594,7 +581,7 @@ function LearningContent({
 }
 
 /* =========================
-   Chat Input Component
+   Chat Input
 ========================= */
 function ChatInput({
   currentMessage,
@@ -647,7 +634,7 @@ function ChatInput({
 }
 
 /* =========================
-   Main Page Component
+   Main Page
 ========================= */
 export default function Page() {
   const [currentMessage, setCurrentMessage] = useState("");
@@ -666,6 +653,9 @@ export default function Page() {
     topicName: string;
     subtopicName: string;
   } | null>(null);
+
+  const [chatId, setChatId] = useState<string | null>(null);
+  const [pathwaySaved, setPathwaySaved] = useState(false);
 
   async function callBackend(q: string): Promise<string> {
     const url = `${API_BASE}/ask?q=${encodeURIComponent(
@@ -700,11 +690,35 @@ export default function Page() {
       timestamp: Date.now(),
     };
 
+    // 1) Create chat on first message (server action)
+    if (!chatId) {
+      const created = await createChat({
+        title: content.slice(0, 60),
+        initialMessages: [userMsg],
+        initialRoadmap: null,
+      });
+      if (!created?.ok) {
+        setMessages((m) => [
+          ...m,
+          {
+            id: crypto.randomUUID(),
+            type: "ai",
+            content: "Failed to create chat.",
+            timestamp: Date.now(),
+          },
+        ]);
+        return;
+      }
+      setChatId(created.chatId);
+    }
+
+    // Local UI
     setMessages((m) => [...m, userMsg]);
     setCurrentMessage("");
     setIsTyping(true);
 
     try {
+      // 2) LLM backend
       const reply = await callBackend(content);
       const aiMsg: ChatMessage = {
         id: crypto.randomUUID(),
@@ -712,20 +726,51 @@ export default function Page() {
         content: reply,
         timestamp: Date.now(),
       };
-      setMessages((m) => [...m, aiMsg]);
+      const newMessages = [...messages, userMsg, aiMsg];
+      setMessages(newMessages);
 
+      // 3) Extract roadmap, persist snapshot
       const plan = tryExtractRoadmapFromText(reply);
       setRoadmap(plan ?? null);
+
+      const id = chatId ?? (await (async () => null)()); // safeguard if state hasn't committed yet
+      if (id) {
+        await saveChatSnapshot({
+          chatId: id,
+          messages: newMessages,
+          roadmap: plan ?? null,
+          titleFallback: messages.length <= 2 ? content.slice(0, 60) : null,
+        });
+      } else {
+        // micro-queue if chatId was set this tick
+        setTimeout(async () => {
+          if (chatId) {
+            await saveChatSnapshot({
+              chatId,
+              messages: newMessages,
+              roadmap: plan ?? null,
+            });
+          }
+        }, 0);
+      }
     } catch (e: any) {
-      setMessages((m) => [
-        ...m,
-        {
-          id: crypto.randomUUID(),
-          type: "ai",
-          content: `Could not reach server: ${e?.message ?? "Unknown error"}`,
-          timestamp: Date.now(),
-        },
-      ]);
+      const errMsg = `Could not reach server: ${e?.message ?? "Unknown error"}`;
+      const aiErr: ChatMessage = {
+        id: crypto.randomUUID(),
+        type: "ai",
+        content: errMsg,
+        timestamp: Date.now(),
+      };
+      const newMessages = [...messages, userMsg, aiErr];
+      setMessages(newMessages);
+
+      if (chatId) {
+        await saveChatSnapshot({
+          chatId,
+          messages: newMessages,
+          roadmap,
+        });
+      }
     } finally {
       setIsTyping(false);
     }
@@ -787,10 +832,20 @@ export default function Page() {
         {/* Learning Content Section */}
         {isLearningMode && selectedLearningTopic && (
           <div className="w-1/2 h-full">
-            <LearningContent
+            {/* <LearningContent
               topicName={selectedLearningTopic.topicName}
               subtopicName={selectedLearningTopic.subtopicName}
               onClose={closeLearningContent}
+            /> */}
+            <MCQCard
+              question={`Which statement about ${selectedLearningTopic} is true?`}
+              options={[
+                "It is unrelated to React rendering.",
+                `It helps organize ${selectedLearningTopic} for maintainability.`,
+                "It always slows down performance.",
+                "It cannot be used with TypeScript.",
+              ]}
+              correctIndex={1}
             />
           </div>
         )}
