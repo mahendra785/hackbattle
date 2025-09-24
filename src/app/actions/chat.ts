@@ -13,19 +13,11 @@ async function resolveUserIdFromSession(): Promise<string> {
   const session = await getServerSession(); // If your app needs options, pass them here.
   const email = session?.user?.email?.trim() || null;
   const name  = session?.user?.name?.trim() || null;
-
+console.log("Session user:", { email, name });  
   // 1) Prefer email (unique, stable)
   if (email) {
-    const user = await prisma.user.upsert({
+    const user = await prisma.user.findFirst({
       where: { email },
-      update: {
-        // keep name fresh if provided
-        ...(name ? { name } : {}),
-      },
-      create: {
-        email,
-        name: name ?? undefined,
-      },
       select: { id: true },
     });
     return user.id;
@@ -40,12 +32,7 @@ async function resolveUserIdFromSession(): Promise<string> {
     });
     if (existing) return existing.id;
 
-    // Create a new user row with this display name.
-    // Email is left null (allowed by your schema).
-    const created = await prisma.user.create({
-      data: { name },
-      select: { id: true },
-    });
+
     return created.id;
   }
 
@@ -132,4 +119,25 @@ export async function saveChatSnapshot(params: {
   });
 
   return { ok: true as const };
+}
+/** ✅ FIXED: list chats for the *current* user id (NOT name) */
+export async function listChats() {
+  const userId = await resolveUserIdFromSession();
+
+  const items = await prisma.chat.findMany({
+    where: { userId, deletedAt: null },
+    select: { id: true, title: true, startedAt: true, updatedAt: true },
+    orderBy: { updatedAt: "desc" },
+  });
+
+  // Convert Dates to ISO strings (fully JSON-serializable)
+  return {
+    ok: true as const,
+    items: items.map((c) => ({
+      id: c.id,
+      title: c.title,
+      startedAt: c.startedAt.toISOString(),
+      updatedAt: c.updatedAt.toISOString(),
+    })),
+  };
 }
