@@ -22,7 +22,7 @@ import remarkMath from "remark-math";
 import rehypeKatex from "rehype-katex";
 import "katex/dist/katex.min.css";
 import { webSearchPPLX } from "@/app/actions/websearch";
-
+import { generateQuizViaGemini } from "@/app/actions/gemini";
 import {
   saveChatSnapshot,
   savePlanAsPathway,
@@ -90,6 +90,14 @@ type Meta = {
     accuracy: number; // 0..1
   }>;
   sources?: SourceDoc[];
+  // optional extension for quiz seeds
+  quizSeeds?: Array<{
+    ts: number;
+    topic: string;
+    subtopic: string;
+    countMcq: number;
+    countText: number;
+  }>;
 };
 
 /* =========================
@@ -202,7 +210,6 @@ function buildContextString(opts: {
     recentSources: srcs,
   };
 
-  // keep it compact to avoid URL overflows; backend should accept JSON string
   try {
     return JSON.stringify(ctx);
   } catch {
@@ -219,11 +226,8 @@ async function askPdfQuery(
   const fd = new FormData();
   fd.append("file", file);
   fd.append("query", question || "Summarize key ideas and definitions.");
-  // INSIDE askPdfQuery, after fd.append("query", ...):
   if (contextString) fd.append("context", contextString);
   if (metadataString) fd.append("metadata", metadataString);
-
-  if (contextString) fd.append("context", contextString);
 
   const res = await fetch(PDF_QUERY_POST, {
     method: "POST",
@@ -268,6 +272,17 @@ async function postJSON<T = any>(url: string, body: unknown): Promise<T> {
   } catch {
     return text as any;
   }
+}
+
+// Quiz intent helpers
+function isQuizIntent(q: string) {
+  const s = q.toLowerCase();
+  return /(quiz|quizz|mcq|questions?|practice|test|problems?)/i.test(s);
+}
+/** naive topic extractor: tries “…on/about/for <topic>” */
+function guessTopicFromPrompt(q: string) {
+  const m = q.match(/\b(?:on|about|for)\s+([A-Za-z0-9 .+\-/#]+)$/i);
+  return m ? m[1].trim() : "";
 }
 
 /* =========================
@@ -915,8 +930,8 @@ function ChatInput({
                 className="hidden"
                 onChange={(e) => {
                   const f = e.target.files?.[0];
-                  if (f) onPickPdf(f); // attach; we use ONLY the textarea prompt when sending
-                  e.currentTarget.value = ""; // allow re-selecting same file
+                  if (f) onPickPdf(f);
+                  e.currentTarget.value = "";
                 }}
               />
 
@@ -981,18 +996,23 @@ function ChatInput({
 /* =========================
    NEW: PracticePanel (2 MCQs + 1 Text, submit together, show solutions, more if <70%)
 ========================= */
+/* =========================
+   PracticePanel (adaptive difficulty)
+========================= */
 function PracticePanel({
   chatId,
   topic,
   subtopic,
   contextString,
+  seed,
   onAppendMessage,
   onAppendPerfEvent,
 }: {
   chatId: string;
   topic: string;
   subtopic: string;
-  contextString: string; // NEW: pass context down and into generator
+  contextString: string;
+  seed?: { mcqs: GeneratedMCQ[]; texts: GeneratedTextQ[] } | null;
   onAppendMessage: (m: { content: string }) => void;
   onAppendPerfEvent: (e: {
     kind: "mcq" | "text";
@@ -1015,6 +1035,11 @@ function PracticePanel({
   ]);
   const [textAnswer, setTextAnswer] = useState("");
 
+  // difficulty state
+  type Diff = "auto" | "easier" | "same" | "harder";
+  const [difficulty, setDifficulty] = useState<Diff>("auto"); // current setting for next batch
+  const [suggestedDifficulty, setSuggestedDifficulty] = useState<Diff>("auto"); // suggestion after grading
+
   // review history (previous rounds)
   type MCQReview = GeneratedMCQ & {
     pickedIndex: number | null;
@@ -1030,24 +1055,50 @@ function PracticePanel({
     Array<{ mcqs: MCQReview[]; text: TextReview; accuracy: number }>
   >([]);
 
-  const THRESHOLD = 0.7;
+  const THRESHOLD_OK = 0.7;
+  const THRESHOLD_HARDER = 0.9;
+
   const fullyAnswered =
     mcqAnswers.every((v) => typeof v === "number") &&
     textAnswer.trim().length > 0;
 
-  async function loadBatch() {
+  // merge difficulty into the compact learner context JSON
+  function contextWithDifficulty(base: string, d: Diff) {
+    try {
+      const obj = base ? JSON.parse(base) : {};
+      const practice =
+        typeof obj.practice === "object" && obj.practice !== null
+          ? obj.practice
+          : {};
+      obj.practice = {
+        ...practice,
+        difficulty: d,
+        // breadcrumbs helpful to the generator:
+        lastTopic: topic,
+        lastSubtopic: subtopic,
+        lastBatchSize: { mcq: 2, text: 1 },
+        ts: Date.now(),
+      };
+      return JSON.stringify(obj);
+    } catch {
+      // very defensive fallback
+      return base;
+    }
+  }
+
+  async function loadBatch(nextDiff: Diff = difficulty) {
     setLoading(true);
     setErr(null);
     try {
-      // NOTE: we pass contextString into the quiz generator. If TS complains,
-      // cast to any so we can forward the extra field without breaking types.
+      const effectiveCtx = contextWithDifficulty(contextString, nextDiff);
       const res = await (generatePractice as any)({
         topic,
         subtopic,
         roadmap: [],
         numMcqs: 2,
         numTexts: 1,
-        context: contextString,
+        context: effectiveCtx,
+        difficulty: nextDiff, // if your server supports it, great; otherwise ignored
       });
       setMcqs(res.mcqs.slice(0, 2));
       setTextQ(
@@ -1065,8 +1116,20 @@ function PracticePanel({
   }
 
   useEffect(() => {
-    loadBatch();
-  }, [topic, subtopic, contextString]);
+    if (seed && seed.mcqs?.length) {
+      setMcqs(seed.mcqs.slice(0, 2));
+      setTextQ(
+        seed.texts?.[0] ?? { prompt: `In 3–5 sentences, explain: ${subtopic}` }
+      );
+      setMcqAnswers([null, null]);
+      setTextAnswer("");
+      setDifficulty("auto");
+      setSuggestedDifficulty("auto");
+      return;
+    }
+    loadBatch("auto");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [topic, subtopic, contextString, seed]);
 
   async function submitAll() {
     if (!fullyAnswered || !textQ) return;
@@ -1093,7 +1156,7 @@ function PracticePanel({
       (gradedMcqs[0].correct ? 1 : 0) + (gradedMcqs[1].correct ? 1 : 0);
     const accuracy = (mcqScore + textScore) / 3;
 
-    // persist perf events
+    // persist perf events -> parent meta updates -> flows back into contextString
     gradedMcqs.forEach((g) =>
       onAppendPerfEvent({
         kind: "mcq",
@@ -1108,18 +1171,7 @@ function PracticePanel({
       accuracy: textScore,
     });
 
-    // push summary in chat
-    onAppendMessage({
-      content: `Practice recap for “${subtopic}”: ${(accuracy * 100).toFixed(
-        0
-      )}%. ${
-        accuracy < THRESHOLD
-          ? "I’ll give you a few more practice questions."
-          : "Great job — want more practice or move on?"
-      }\n\nWould you like an explanation for any item above?`,
-    });
-
-    // store review (show solutions)
+    // store review (solutions)
     setReviews((prev) => [
       ...prev,
       {
@@ -1134,14 +1186,25 @@ function PracticePanel({
       },
     ]);
 
-    // load more if needed
-    if (accuracy < THRESHOLD) {
-      await loadBatch();
-    } else {
-      // keep the batch on screen but reset answers so user can decide next
-      setMcqAnswers([null, null]);
-      setTextAnswer("");
-    }
+    // suggest difficulty for NEXT round
+    let suggestion: Diff = "same";
+    if (accuracy < THRESHOLD_OK) suggestion = "easier";
+    else if (accuracy >= THRESHOLD_HARDER) suggestion = "harder";
+    setSuggestedDifficulty(suggestion);
+    setDifficulty(suggestion);
+
+    // Instead of a generic recap, ask for difficulty preference
+    onAppendMessage({
+      content:
+        `You scored **${(accuracy * 100).toFixed(0)}%** on “${subtopic}”. ` +
+        `Want the next round to be **easier**, **same**, or **harder**? ` +
+        `(Suggested: **${suggestion}**.)\n\n` +
+        `Tell me your preference or use the buttons in the right panel.`,
+    });
+
+    // clear current answers; wait for user choice before loading more
+    setMcqAnswers([null, null]);
+    setTextAnswer("");
   }
 
   return (
@@ -1214,7 +1277,31 @@ function PracticePanel({
           </div>
         )}
 
-        <div className="flex items-center justify-end gap-2">
+        <div className="flex items-center justify-between gap-2">
+          {/* Difficulty chooser – appears anytime, so learners can steer before submitting */}
+          <div className="flex items-center gap-1">
+            <span className="text-xs text-neutral-500 mr-1">Next round:</span>
+            {(["easier", "same", "harder"] as Diff[]).map((d) => (
+              <button
+                key={d}
+                onClick={() => setDifficulty(d)}
+                className={`text-xs rounded-lg border px-2 py-1 ${
+                  difficulty === d
+                    ? "border-amber-500 bg-amber-500/10 text-amber-200"
+                    : "border-neutral-800 bg-neutral-800/40 hover:bg-neutral-800 text-neutral-300"
+                }`}
+                title={
+                  suggestedDifficulty === d
+                    ? "Suggested based on your last score"
+                    : ""
+                }
+              >
+                {d}
+                {suggestedDifficulty === d ? " • suggested" : ""}
+              </button>
+            ))}
+          </div>
+
           <button
             onClick={submitAll}
             disabled={!fullyAnswered || loading}
@@ -1225,6 +1312,20 @@ function PracticePanel({
             }`}
           >
             Submit practice (2 MCQ + 1 Text)
+          </button>
+        </div>
+      </div>
+
+      {/* “Load next” control (separate from submission) */}
+      <div className="rounded-2xl border border-neutral-800 bg-neutral-900 p-3">
+        <div className="flex items-center gap-2">
+          <span className="text-xs text-neutral-500">Ready for more?</span>
+          <button
+            onClick={() => loadBatch(difficulty)}
+            className="text-xs rounded-lg border border-neutral-800 bg-neutral-800/40 hover:bg-neutral-800 text-neutral-200 px-2 py-1"
+            disabled={loading}
+          >
+            Generate next set ({difficulty})
           </button>
         </div>
       </div>
@@ -1259,8 +1360,8 @@ function PracticePanel({
                           q.correct ? "text-emerald-300" : "text-red-300"
                         }
                       >
-                        {typeof q.pickedIndex === "number"
-                          ? q.options[q.pickedIndex]
+                        {typeof (q as any).pickedIndex === "number"
+                          ? q.options[(q as any).pickedIndex]
                           : "—"}
                       </span>
                       {"  "}• Correct:{" "}
@@ -1268,9 +1369,9 @@ function PracticePanel({
                         {q.options[q.correctIndex]}
                       </span>
                     </div>
-                    {q.explanation && (
+                    {(q as any).explanation && (
                       <div className="text-xs text-neutral-400">
-                        Why: {q.explanation}
+                        Why: {(q as any).explanation}
                       </div>
                     )}
                   </div>
@@ -1280,7 +1381,7 @@ function PracticePanel({
                 <div className="mt-2">
                   <div className="text-sm font-medium mb-1">Text question</div>
                   <div className="text-xs text-neutral-500 mb-1">
-                    Score: {(r.text.score * 100).toFixed(0)}%
+                    Score: {((r.text.score ?? 0) * 100).toFixed(0)}%
                   </div>
                   <div className="text-sm whitespace-pre-wrap rounded border border-neutral-800 bg-neutral-950 px-3 py-2">
                     {r.text.user || "—"}
@@ -1313,6 +1414,7 @@ export default function ChatByIdPage() {
     history: [],
     performance: [],
     sources: [],
+    quizSeeds: [],
   });
   const [selectedLearningTopic, setSelectedLearningTopic] = useState<{
     topicName: string;
@@ -1365,10 +1467,14 @@ export default function ChatByIdPage() {
         const perf = ((snap.chat as any).performance ??
           []) as Meta["performance"];
         const sources = ((snap.chat as any).sources ?? []) as Meta["sources"];
+        const quizSeeds =
+          ((snap.chat as any).meta?.quizSeeds as Meta["quizSeeds"]) ?? [];
+
         setMeta({
           history: Array.isArray(hist) ? hist : [],
           performance: Array.isArray(perf) ? perf : [],
           sources: Array.isArray(sources) ? sources : [],
+          quizSeeds: Array.isArray(quizSeeds) ? quizSeeds : [],
         });
       } catch {
         setMessages([
@@ -1415,6 +1521,23 @@ export default function ChatByIdPage() {
     }
     return text;
   }
+  // ---- helpers (quiz intent) ----
+  function isQuizIntent(q: string) {
+    const s = q.toLowerCase();
+    return /(quiz|quizz|mcq|questions?|practice|test|problems?)/i.test(s);
+  }
+
+  /** naive topic extractor from trailing "... on/about/for <topic>" */
+  function guessTopicFromPrompt(q: string) {
+    const m = q.match(/\b(?:on|about|for)\s+([A-Za-z0-9 .+\-/#]+)$/i);
+    return m ? m[1].trim() : "";
+  }
+
+  // ---- extra UI state for seeded quizzes (Gemini) ----
+  const [practiceSeed, setPracticeSeed] = useState<{
+    mcqs: GeneratedMCQ[];
+    texts: GeneratedTextQ[];
+  } | null>(null);
 
   // --- send handler ---
   async function handleSend(text: string) {
@@ -1570,7 +1693,7 @@ export default function ChatByIdPage() {
     // If no attachments and no text, do nothing
     if (!question) return;
 
-    // ------- NORMAL or WEB-SEARCH FLOW -------
+    // ------- NORMAL or WEB-SEARCH (with early GEMINI QUIZ branch) -------
     const userMsg: TextMessage = {
       id: crypto.randomUUID(),
       type: "user",
@@ -1589,6 +1712,97 @@ export default function ChatByIdPage() {
 
     setIsTyping(true);
     try {
+      // ======== GEMINI QUIZ INTENT (short-circuits the rest) ========
+      if (isQuizIntent(question)) {
+        const topicGuess =
+          guessTopicFromPrompt(question) ||
+          selectedLearningTopic?.topicName ||
+          "General";
+        const subGuess = selectedLearningTopic?.subtopicName || topicGuess;
+
+        // Inside handleSend (quiz-intent branch)
+
+        // Build both:
+        const contextString = buildContextString({
+          chatId,
+          messages: afterUser,
+          meta: newMeta,
+          selectedTopic: selectedLearningTopic,
+          lastRoadmap: null,
+        });
+        const metadata = buildPayloadMetadata(
+          afterUser,
+          null,
+          newMeta,
+          question
+        );
+
+        // Call Gemini with context + metadata
+        const quiz = await generateQuizViaGemini({
+          topic: topicGuess,
+          subtopic: subGuess,
+          prompt: question,
+          contextString,
+          metadata, // <-- NEW: pass the full metadata too
+          countMcq: 4,
+          countText: 1,
+        });
+
+        // Persist a breadcrumb in meta for audit/analytics
+        const newMetaWithQuiz: Meta & {
+          quizSeeds?: Array<{
+            ts: number;
+            topic: string;
+            subtopic: string;
+            countMcq: number;
+            countText: number;
+          }>;
+        } = {
+          ...(newMeta as any),
+          quizSeeds: [
+            ...((newMeta as any).quizSeeds ?? []),
+            {
+              ts: Date.now(),
+              topic: topicGuess,
+              subtopic: subGuess,
+              countMcq: quiz.mcqs.length,
+              countText: quiz.texts.length,
+            },
+          ],
+        };
+        setMeta(newMetaWithQuiz);
+
+        await saveChatSnapshot({
+          chatId,
+          messages: afterUser.filter(
+            (m): m is TextMessage => m.type === "user" || m.type === "ai"
+          ),
+          roadmap: null,
+          titleFallback: afterUser.length <= 2 ? question.slice(0, 60) : null,
+          meta: newMetaWithQuiz as any,
+        });
+
+        // Open right panel and seed PracticePanel
+        setSelectedLearningTopic({
+          topicName: topicGuess,
+          subtopicName: subGuess,
+        });
+        setPracticeSeed({ mcqs: quiz.mcqs, texts: quiz.texts });
+
+        // Optional nudge in chat stream
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: crypto.randomUUID(),
+            type: "ai",
+            content: `I created a quiz on **${subGuess}** (Gemini). Open on the right to begin.`,
+            timestamp: Date.now(),
+          } as TextMessage,
+        ]);
+
+        return; // stop here (don’t run web/general flow)
+      }
+
       if (useWebSearch) {
         // 1) Build metadata for context (same shape you already use elsewhere)
         const metadataForSearch = buildPayloadMetadata(
@@ -1891,9 +2105,12 @@ export default function ChatByIdPage() {
 
   function handleSubtopicClick(topicName: string, subtopicName: string) {
     setSelectedLearningTopic({ topicName, subtopicName });
+    // if the user navigates manually, clear any previous Gemini seed
+    setPracticeSeed(null);
   }
   function closeLearningContent() {
     setSelectedLearningTopic(null);
+    setPracticeSeed(null);
   }
 
   const isLearningMode = selectedLearningTopic !== null;
@@ -1910,17 +2127,24 @@ export default function ChatByIdPage() {
       <Header />
 
       {/* BELOW <Header /> */}
-      <div className="h-[calc(100vh-56px)] grid grid-cols-1 lg:grid-cols-2 gap-0 bg-[#0b0b0c] overflow-hidden">
+      <div
+        className={
+          `h-[calc(100vh-56px)] grid ` +
+          (isLearningMode ? "grid-cols-1 lg:grid-cols-2" : "grid-cols-1") +
+          " gap-0 bg-[#0b0b0c] overflow-hidden transition-all duration-200"
+        }
+      >
         {/* Left: Chat */}
         <div className="col-span-1 flex flex-col overflow-hidden">
           <main
-            className={`flex-1 overflow-y-auto overscroll-contain px-4 py-6 ${
-              isLearningMode ? "max-w-none" : "mx-auto max-w-3xl"
-            } scroll-smooth`}
+            className={
+              "flex-1 overflow-y-auto overscroll-contain px-4 py-6 scroll-smooth " +
+              (isLearningMode ? "" : "mx-auto w-full max-w-3xl lg:max-w-4xl")
+            }
           >
             {/* Empty-state hero */}
-            {messages.length <= 1 && (
-              <div className="mx-auto max-w-3xl mb-6">
+            {messages.length <= 1 && !isLearningMode && (
+              <div className="mb-6">
                 <div className="rounded-xl border border-neutral-900 bg-neutral-950/60 p-6 md:p-7 space-y-2 text-center">
                   <div className="inline-flex items-center gap-2 rounded-full border border-neutral-900 bg-neutral-950 px-3 py-1 text-[11px] text-neutral-400">
                     <Sparkles size={14} /> Minimal, fast, focused
@@ -1935,7 +2159,12 @@ export default function ChatByIdPage() {
               </div>
             )}
 
-            <div className="mx-auto max-w-3xl">
+            {/* Chat stream */}
+            <div
+              className={
+                isLearningMode ? "" : "mx-auto w-full max-w-3xl lg:max-w-4xl"
+              }
+            >
               <ChatMessages
                 messages={messages}
                 isTyping={isTyping}
@@ -1944,34 +2173,40 @@ export default function ChatByIdPage() {
             </div>
           </main>
 
-          {/* Composer stays docked inside the left pane only */}
-          <ChatInput
-            currentMessage={currentMessage}
-            setCurrentMessage={setCurrentMessage}
-            onSend={handleSend}
-            onPickPdf={(file) =>
-              setAttachments((prev) => {
-                const exists = prev.some(
-                  (f) => f.name === file.name && f.size === file.size
-                );
-                return exists ? prev : [...prev, file];
-              })
+          {/* Composer */}
+          <div
+            className={
+              isLearningMode ? "" : "mx-auto w-full max-w-3xl lg:max-w-4xl"
             }
-            attachments={attachments}
-            onRemoveAttachment={(index) =>
-              setAttachments((prev) => prev.filter((_, i) => i !== index))
-            }
-            disabled={
-              !chatId || (!currentMessage.trim() && attachments.length === 0)
-            }
-            showPracticeToggle={!!selectedLearningTopic}
-            practiceOpen={!!selectedLearningTopic}
-            onTogglePractice={() =>
-              selectedLearningTopic ? closeLearningContent() : null
-            }
-            useWebSearch={useWebSearch}
-            setUseWebSearch={setUseWebSearch}
-          />
+          >
+            <ChatInput
+              currentMessage={currentMessage}
+              setCurrentMessage={setCurrentMessage}
+              onSend={handleSend}
+              onPickPdf={(file) =>
+                setAttachments((prev) => {
+                  const exists = prev.some(
+                    (f) => f.name === file.name && f.size === file.size
+                  );
+                  return exists ? prev : [...prev, file];
+                })
+              }
+              attachments={attachments}
+              onRemoveAttachment={(index) =>
+                setAttachments((prev) => prev.filter((_, i) => i !== index))
+              }
+              disabled={
+                !chatId || (!currentMessage.trim() && attachments.length === 0)
+              }
+              showPracticeToggle={!!selectedLearningTopic}
+              practiceOpen={!!selectedLearningTopic}
+              onTogglePractice={() =>
+                selectedLearningTopic ? closeLearningContent() : null
+              }
+              useWebSearch={useWebSearch}
+              setUseWebSearch={setUseWebSearch}
+            />
+          </div>
         </div>
 
         {/* Right: Practice Panel (independent scroll) */}
@@ -1992,12 +2227,29 @@ export default function ChatByIdPage() {
 
             {/* Make this the scroller */}
             <div className="grow overflow-y-auto overscroll-contain p-4 space-y-4 scroll-smooth">
-              <LearningContent query={selectedLearningTopic.subtopicName} />
+              <LearningContent
+                query={selectedLearningTopic.subtopicName}
+                contextString={buildContextString({
+                  chatId,
+                  messages,
+                  meta,
+                  selectedTopic: selectedLearningTopic,
+                  lastRoadmap: null,
+                })}
+              />
 
               <PracticePanel
                 chatId={chatId!}
                 topic={selectedLearningTopic.topicName}
                 subtopic={selectedLearningTopic.subtopicName}
+                contextString={buildContextString({
+                  chatId,
+                  messages,
+                  meta,
+                  selectedTopic: selectedLearningTopic,
+                  lastRoadmap: null,
+                })}
+                seed={practiceSeed /* NEW: seed when coming from Gemini */}
                 onAppendMessage={(m) =>
                   setMessages((prev) => [
                     ...prev,
