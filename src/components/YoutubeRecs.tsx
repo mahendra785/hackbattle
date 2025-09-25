@@ -53,9 +53,7 @@ export default function YoutubeRecs({ topic }: YoutubeRecsProps) {
             {/* Header */}
             <div className="p-4 border-b border-neutral-800">
               <h2 className="text-lg font-semibold">YouTube Recommendations</h2>
-              <p className="text-sm text-neutral-400 mt-1">
-                Topic: {topic}
-              </p>
+              <p className="text-sm text-neutral-400 mt-1">Topic: {topic}</p>
             </div>
 
             {/* Video List */}

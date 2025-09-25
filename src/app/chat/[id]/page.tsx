@@ -16,6 +16,13 @@ import {
 import { useSession } from "next-auth/react";
 import { useParams } from "next/navigation";
 
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
+import remarkMath from "remark-math";
+import rehypeKatex from "rehype-katex";
+import "katex/dist/katex.min.css";
+import { webSearchPPLX } from "@/app/actions/websearch";
+
 import {
   saveChatSnapshot,
   savePlanAsPathway,
@@ -29,8 +36,8 @@ import {
 } from "@/app/actions/quiz";
 import { appendPerformanceEvent } from "@/app/actions/progress";
 
-import MCQCard from "../../../components/mcq"; // (kept for compatibility; not used by the new panel)
-import TextAnswerCard from "../../../components/Text"; // (kept for compatibility; not used by the new panel)
+import MCQCard from "../../../components/mcq"; // kept for compatibility
+import TextAnswerCard from "../../../components/Text"; // kept for compatibility
 import YoutubeRecs from "../../../components/YoutubeRecs";
 
 /* =========================
@@ -89,10 +96,17 @@ type Meta = {
    Config
 ========================= */
 const API_BASE = "https://retiform-leonida-stifledly.ngrok-free.dev";
-const ROADMAP_GET = (q: string) =>
-  `${API_BASE}/ask?q=${encodeURIComponent(q)}&_ngrok_skip_browser_warning=true`;
+const ROADMAP_GET = (q: string, ctx?: string) =>
+  `${API_BASE}/ask?q=${encodeURIComponent(q)}${
+    ctx ? `&context=${encodeURIComponent(ctx)}` : ""
+  }&_ngrok_skip_browser_warning=true`;
 const CHAT_POST = `${API_BASE}/general`;
 const PDF_QUERY_POST = `${API_BASE}/pdf/query`;
+const WEB_SEARCH_POST = `${API_BASE}/web/search`; // ← implement this on your backend
+const CONTENT_GET = (q: string, ctx?: string) =>
+  `${API_BASE}/content/?q=${encodeURIComponent(q)}${
+    ctx ? `&context=${encodeURIComponent(ctx)}` : ""
+  }&_ngrok_skip_browser_warning=true`;
 
 /* =========================
    Helpers
@@ -137,12 +151,14 @@ function roadmapLeadIn(plan: Roadmap): string {
 function buildPayloadMetadata(
   messages: ChatMessage[],
   latestPlan: Roadmap | null,
-  meta: Meta
+  meta: Meta,
+  prompt: string
 ) {
   return {
     events: [],
     roadmap: latestPlan ?? [],
     meta,
+    prompt,
     messages: messages
       .filter((m): m is TextMessage => m.type === "user" || m.type === "ai")
       .map((m) => ({
@@ -151,16 +167,63 @@ function buildPayloadMetadata(
         content: (m as TextMessage).content,
         timestamp: m.timestamp,
       })),
+  } as const;
+}
+
+// NEW: build a compact context string that we can pass to every route
+function buildContextString(opts: {
+  chatId?: string | null;
+  messages: ChatMessage[];
+  meta: Meta;
+  selectedTopic?: { topicName: string; subtopicName: string } | null;
+  lastRoadmap?: Roadmap | null;
+}) {
+  const { chatId, messages, meta, selectedTopic, lastRoadmap } = opts;
+  const turns = messages
+    .filter((m): m is TextMessage => m.type === "user" || m.type === "ai")
+    .slice(-8)
+    .map((m) => ({ role: m.type, content: m.content, ts: m.timestamp }));
+
+  const perf = meta.performance.slice(-12);
+  const srcs = (meta.sources || []).slice(-6).map((s) => ({
+    type: s.type,
+    filename: s.filename,
+    context_excerpt: s.context_excerpt,
+  }));
+
+  const ctx = {
+    chatId,
+    focus: selectedTopic
+      ? { topic: selectedTopic.topicName, subtopic: selectedTopic.subtopicName }
+      : undefined,
+    lastRoadmapTopics: lastRoadmap?.map((t) => t.name),
+    recentTurns: turns,
+    recentPerformance: perf,
+    recentSources: srcs,
   };
+
+  // keep it compact to avoid URL overflows; backend should accept JSON string
+  try {
+    return JSON.stringify(ctx);
+  } catch {
+    return "{}";
+  }
 }
 
 async function askPdfQuery(
   file: File,
-  question: string
+  question: string,
+  contextString?: string,
+  metadataString?: string
 ): Promise<PdfQueryResponse> {
   const fd = new FormData();
   fd.append("file", file);
   fd.append("query", question || "Summarize key ideas and definitions.");
+  // INSIDE askPdfQuery, after fd.append("query", ...):
+  if (contextString) fd.append("context", contextString);
+  if (metadataString) fd.append("metadata", metadataString);
+
+  if (contextString) fd.append("context", contextString);
 
   const res = await fetch(PDF_QUERY_POST, {
     method: "POST",
@@ -178,6 +241,33 @@ async function askPdfQuery(
     throw new Error(`Backend error ${res.status}: ${text.substring(0, 200)}`);
   }
   return JSON.parse(text) as PdfQueryResponse;
+}
+
+async function postJSON<T = any>(url: string, body: unknown): Promise<T> {
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      "ngrok-skip-browser-warning": "true",
+      Accept: "application/json,text/plain;q=0.9",
+      "Content-Type": "application/json",
+      "Cache-Control": "no-cache",
+    },
+    mode: "cors",
+    body: JSON.stringify(body),
+  });
+  const text = await res.text();
+  const ct = res.headers.get("content-type") || "";
+  if (ct.includes("text/html") || text.includes("ERR_NGROK_6024")) {
+    throw new Error("Ngrok splash intercepted the request.");
+  }
+  if (!res.ok) {
+    throw new Error(`Backend error ${res.status}: ${text.substring(0, 200)}`);
+  }
+  try {
+    return JSON.parse(text);
+  } catch {
+    return text as any;
+  }
 }
 
 /* =========================
@@ -229,7 +319,13 @@ function Header() {
 /* =========================
    Learning Content (RIGHT PANEL)
 ========================= */
-function LearningContent({ query }: { query: string }) {
+function LearningContent({
+  query,
+  contextString,
+}: {
+  query: string;
+  contextString?: string;
+}) {
   const [items, setItems] = useState<ContentItem[] | null>(null);
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState<string | null>(null);
@@ -242,9 +338,7 @@ function LearningContent({ query }: { query: string }) {
       setErr(null);
       setItems(null);
       try {
-        const url = `${API_BASE}/content/?q=${encodeURIComponent(
-          query
-        )}&_ngrok_skip_browser_warning=true`;
+        const url = CONTENT_GET(query, contextString);
         const res = await fetch(url, {
           method: "GET",
           mode: "cors",
@@ -273,7 +367,7 @@ function LearningContent({ query }: { query: string }) {
     return () => {
       alive = false;
     };
-  }, [query]);
+  }, [query, contextString]);
 
   if (loading) {
     return (
@@ -579,7 +673,7 @@ function InteractiveRoadmap({
 }
 
 /* =========================
-   Chat Messages
+   Chat Messages (AI uses Markdown)
 ========================= */
 function ChatMessages({
   messages,
@@ -627,8 +721,46 @@ function ChatMessages({
             <div className="h-8 w-8 rounded-full bg-neutral-900 border border-neutral-800 grid place-items-center flex-shrink-0">
               <Sparkles size={14} className="text-amber-400" />
             </div>
-            <div className="flex-1 rounded-2xl bg-neutral-900/70 border border-neutral-800 px-4 py-3 leading-relaxed whitespace-pre-wrap">
-              {tm.content}
+            <div className="flex-1 rounded-2xl bg-neutral-900/70 border border-neutral-800 px-4 py-3 leading-relaxed prose prose-invert max-w-none">
+              <ReactMarkdown
+                remarkPlugins={[remarkGfm, remarkMath]}
+                rehypePlugins={[rehypeKatex]}
+                components={{
+                  code(props) {
+                    const { children, className, ...rest } = props as any;
+                    const isInline = !String(className || "").includes(
+                      "language-"
+                    );
+                    return isInline ? (
+                      <code
+                        className="px-1.5 py-0.5 rounded bg-neutral-800/70 border border-neutral-800"
+                        {...rest}
+                      >
+                        {children}
+                      </code>
+                    ) : (
+                      <pre
+                        className="p-3 rounded-xl bg-neutral-950 border border-neutral-800 overflow-x-auto"
+                        {...rest}
+                      >
+                        <code className={className}>{children}</code>
+                      </pre>
+                    );
+                  },
+                  table(props) {
+                    return (
+                      <div className="overflow-x-auto">
+                        <table
+                          className="table-auto w-full border-collapse"
+                          {...props}
+                        />
+                      </div>
+                    );
+                  },
+                }}
+              >
+                {tm.content}
+              </ReactMarkdown>
             </div>
           </div>
         ) : (
@@ -682,7 +814,7 @@ function QuickChips({ onPick }: { onPick: (s: string) => void }) {
 }
 
 /* =========================
-   Chat Input (textarea prompt + attachments)
+   Chat Input (textarea prompt + attachments + Live Search toggle)
 ========================= */
 function ChatInput({
   currentMessage,
@@ -695,6 +827,8 @@ function ChatInput({
   showPracticeToggle,
   practiceOpen,
   onTogglePractice,
+  useWebSearch,
+  setUseWebSearch,
 }: {
   currentMessage: string;
   setCurrentMessage: (message: string) => void;
@@ -706,6 +840,8 @@ function ChatInput({
   showPracticeToggle: boolean;
   practiceOpen: boolean;
   onTogglePractice: () => void;
+  useWebSearch: boolean;
+  setUseWebSearch: (v: boolean) => void;
 }) {
   const fileRef = useRef<HTMLInputElement | null>(null);
 
@@ -757,8 +893,8 @@ function ChatInput({
           )}
 
           {/* Toolbar */}
-          <div className="flex items-center justify-between px-2 pb-2">
-            <div className="flex items-center gap-2 text-[11px] text-neutral-500 pl-2">
+          <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-2 pb-2">
+            <div className="flex items-center gap-2 text-[11px] text-neutral-500 pl-2 flex-wrap">
               <span className="rounded-full border border-neutral-800 bg-neutral-900 px-2 py-1">
                 Roadmaps • Practice • Videos
               </span>
@@ -779,10 +915,21 @@ function ChatInput({
                 className="hidden"
                 onChange={(e) => {
                   const f = e.target.files?.[0];
-                  if (f) onPickPdf(f); // just attach; we use ONLY the textarea prompt when sending
+                  if (f) onPickPdf(f); // attach; we use ONLY the textarea prompt when sending
                   e.currentTarget.value = ""; // allow re-selecting same file
                 }}
               />
+
+              {/* Live web search toggle */}
+              <label className="ml-2 inline-flex items-center gap-2 text-[11px] rounded-lg px-2.5 py-1.5 border border-neutral-800 bg-neutral-900">
+                <input
+                  type="checkbox"
+                  className="accent-amber-500"
+                  checked={useWebSearch}
+                  onChange={(e) => setUseWebSearch(e.target.checked)}
+                />
+                <span className="text-neutral-300">Web search</span>
+              </label>
             </div>
 
             <div className="flex items-center gap-2">
@@ -838,12 +985,14 @@ function PracticePanel({
   chatId,
   topic,
   subtopic,
+  contextString,
   onAppendMessage,
   onAppendPerfEvent,
 }: {
   chatId: string;
   topic: string;
   subtopic: string;
+  contextString: string; // NEW: pass context down and into generator
   onAppendMessage: (m: { content: string }) => void;
   onAppendPerfEvent: (e: {
     kind: "mcq" | "text";
@@ -890,12 +1039,15 @@ function PracticePanel({
     setLoading(true);
     setErr(null);
     try {
-      const res = await generatePractice({
+      // NOTE: we pass contextString into the quiz generator. If TS complains,
+      // cast to any so we can forward the extra field without breaking types.
+      const res = await (generatePractice as any)({
         topic,
         subtopic,
         roadmap: [],
         numMcqs: 2,
         numTexts: 1,
+        context: contextString,
       });
       setMcqs(res.mcqs.slice(0, 2));
       setTextQ(
@@ -914,7 +1066,7 @@ function PracticePanel({
 
   useEffect(() => {
     loadBatch();
-  }, [topic, subtopic]);
+  }, [topic, subtopic, contextString]);
 
   async function submitAll() {
     if (!fullyAnswered || !textQ) return;
@@ -1169,6 +1321,7 @@ export default function ChatByIdPage() {
 
   // attachments for the composer (PDFs)
   const [attachments, setAttachments] = useState<File[]>([]);
+  const [useWebSearch, setUseWebSearch] = useState<boolean>(false);
 
   // Hydrate from server
   useEffect(() => {
@@ -1233,9 +1386,17 @@ export default function ChatByIdPage() {
       canceled = true;
     };
   }, [chatId]);
+  async function getAskRaw(
+    query: string,
+    contextString?: string,
+    metadataString?: string
+  ): Promise<string> {
+    const base = ROADMAP_GET(query, contextString);
+    const url = metadataString
+      ? `${base}&metadata=${encodeURIComponent(metadataString)}`
+      : base;
 
-  async function getAskRaw(query: string): Promise<string> {
-    const res = await fetch(ROADMAP_GET(query), {
+    const res = await fetch(url, {
       method: "GET",
       headers: {
         "ngrok-skip-browser-warning": "true",
@@ -1255,46 +1416,6 @@ export default function ChatByIdPage() {
     return text;
   }
 
-  async function postJSON<T = any>(url: string, body: unknown): Promise<T> {
-    const res = await fetch(url, {
-      method: "POST",
-      headers: {
-        "ngrok-skip-browser-warning": "true",
-        Accept: "application/json,text/plain;q=0.9",
-        "Content-Type": "application/json",
-        "Cache-Control": "no-cache",
-      },
-      mode: "cors",
-      body: JSON.stringify(body),
-    });
-    const text = await res.text();
-    const ct = res.headers.get("content-type") || "";
-    if (ct.includes("text/html") || text.includes("ERR_NGROK_6024")) {
-      throw new Error("Ngrok splash intercepted the request.");
-    }
-    if (!res.ok) {
-      throw new Error(`Backend error ${res.status}: ${text.substring(0, 200)}`);
-    }
-    try {
-      return JSON.parse(text);
-    } catch {
-      return text as any;
-    }
-  }
-
-  // helper: add/remove attachments
-  function addAttachment(file: File) {
-    setAttachments((prev) => {
-      const exists = prev.some(
-        (f) => f.name === file.name && f.size === file.size
-      );
-      return exists ? prev : [...prev, file];
-    });
-  }
-  function removeAttachment(index: number) {
-    setAttachments((prev) => prev.filter((_, i) => i !== index));
-  }
-
   // --- send handler ---
   async function handleSend(text: string) {
     if (!chatId) return;
@@ -1304,7 +1425,7 @@ export default function ChatByIdPage() {
     // If we have attachments, run PDF flow for each using the textarea prompt, then clear attachments.
     if (attachments.length > 0) {
       const localFiles = [...attachments];
-      setAttachments([]); // clear UI
+      setAttachments([]); // clear UI immediately
 
       for (const file of localFiles) {
         const userMsg: TextMessage = {
@@ -1316,14 +1437,24 @@ export default function ChatByIdPage() {
           timestamp: Date.now(),
         };
         setMessages((prev) => [...prev, userMsg]);
+        const msgsAfter = [...messages, userMsg];
+        const pdfPrompt = question || `Summarize key ideas from "${file.name}"`;
+        const pdfMetadata = buildPayloadMetadata(
+          msgsAfter,
+          null,
+          meta,
+          pdfPrompt
+        );
+        const pdfMetadataString = JSON.stringify(pdfMetadata);
 
         setIsTyping(true);
         try {
           const res = await askPdfQuery(
             file,
-            question || `Summarize key ideas from "${file.name}"`
+            pdfPrompt,
+            undefined,
+            pdfMetadataString
           );
-
           // helper: roadmap check
           const looksLikeRoadmap = (val: any): val is Roadmap =>
             Array.isArray(val) &&
@@ -1439,7 +1570,7 @@ export default function ChatByIdPage() {
     // If no attachments and no text, do nothing
     if (!question) return;
 
-    // ------- NORMAL (non-PDF) FLOW -------
+    // ------- NORMAL or WEB-SEARCH FLOW -------
     const userMsg: TextMessage = {
       id: crypto.randomUUID(),
       type: "user",
@@ -1458,146 +1589,86 @@ export default function ChatByIdPage() {
 
     setIsTyping(true);
     try {
-      const verdict = await classifyPrompt(question);
+      if (useWebSearch) {
+        // 1) Build metadata for context (same shape you already use elsewhere)
+        const metadataForSearch = buildPayloadMetadata(
+          afterUser,
+          null,
+          newMeta,
+          question
+        );
 
-      let finalArray: ChatMessage[] = afterUser;
-      let latestPlan: Roadmap | null = null;
+        // 2) Stronger, shorter instruction (math/citations/quiz-handoff friendly)
+        const minChars = Math.max(1200, question.length * 10);
+        const webInstruction = [
+          "OBJECTIVE:",
+          "Write a current, well-sourced answer tailored to the learner's context (messages + progress metadata).",
+          "",
+          "REQUIREMENTS:",
+          "- Include ISO dates for time-sensitive facts.",
+          "- Add short inline source attributions and a **References** list at the end (≥6 when topic is broad).",
+          "- Typeset math in LaTeX: inline $a^2+b^2=c^2$ and display $$E=mc^2$$.",
+          "- Prefer clear headings and bullets; include small tables where useful.",
+          "- Add a brief 'What changed recently' section when relevant.",
+          "",
+          "QUIZ HANDOFF:",
+          "- If you give any practice questions, ALWAYS include the correct answer and a brief explanation for each (MCQ or short-answer).",
+          "",
+          "OUTPUT:",
+          "- Markdown only.",
+          "- End with a concise 'Key Takeaways' list.",
+          "",
+          "METADATA:",
+          JSON.stringify(metadataForSearch, null, 2),
+        ].join("\n");
 
-      if (verdict.type === "roadmap") {
-        const raw = await getAskRaw(question);
-        const plan = tryExtractRoadmapFromText(raw);
-
-        if (!plan) {
-          const fallbackAI: TextMessage = {
-            id: crypto.randomUUID(),
-            type: "ai",
-            content: raw,
-            timestamp: Date.now(),
-          };
-          setMessages((prev) => (finalArray = [...prev, fallbackAI]));
-
-          const withAi: Meta = {
-            ...newMeta,
-            history: [
-              ...newMeta.history,
-              { ts: Date.now(), user: question, ai: raw },
-            ],
-          };
-          setMeta(withAi);
-
-          await saveChatSnapshot({
-            chatId,
-            messages: finalArray.filter(
-              (m): m is TextMessage => m.type === "user" || m.type === "ai"
-            ),
-            roadmap: null,
-            titleFallback: afterUser.length <= 2 ? question.slice(0, 60) : null,
-            meta: withAi as any,
-          });
-        } else {
-          latestPlan = plan;
-
-          const lead: TextMessage = {
-            id: crypto.randomUUID(),
-            type: "ai",
-            content: roadmapLeadIn(plan),
-            timestamp: Date.now(),
-          };
-          const road: RoadmapMessage = {
-            id: crypto.randomUUID(),
-            type: "roadmap",
-            plan,
-            timestamp: Date.now(),
-          };
-          setMessages((prev) => (finalArray = [...prev, lead, road]));
-
-          const withAi: Meta = {
-            ...newMeta,
-            history: [
-              ...newMeta.history,
-              { ts: Date.now(), user: question, ai: lead.content },
-            ],
-          };
-          setMeta(withAi);
-
-          await savePlanAsPathway({
-            plan,
-            title: "Learning Path",
-            chatId,
-            status: "ACTIVE",
-          });
-
-          await saveChatSnapshot({
-            chatId,
-            messages: finalArray.filter(
-              (m): m is TextMessage => m.type === "user" || m.type === "ai"
-            ),
-            roadmap: latestPlan,
-            titleFallback: afterUser.length <= 2 ? question.slice(0, 60) : null,
-            meta: withAi as any,
-          });
-        }
-      } else {
-        const payloadMeta = newMeta;
-        const metadata = buildPayloadMetadata(afterUser, null, payloadMeta);
-        const result = await postJSON<any>(CHAT_POST, {
-          metadata,
+        // 3) Pass metadata to the server action
+        const result = await webSearchPPLX({
           query: question,
+          minChars,
+          instruction: webInstruction,
+          recency: "month",
+          model: "sonar-pro",
+          metadata: {
+            chatId,
+            userGoal: "learning copilot",
+            prompt: question, // <-- ensure this line exists
+            messages: afterUser
+              .filter((m) => m.type === "user" || m.type === "ai")
+              .slice(-8)
+              .map((m) => ({ role: m.type, content: (m as any).content })),
+            roadmap: [],
+            meta: newMeta,
+          },
         });
 
-        const raw =
-          typeof result === "string"
-            ? result
-            : result?.text ?? JSON.stringify(result);
-        const possiblePlan = tryExtractRoadmapFromText(raw);
-        const cleaned = stripRoadmapJsonFromText(raw);
+        const textOut = result.text || "No content returned.";
+        const refs =
+          Array.isArray(result.sources) && result.sources.length
+            ? `\n\n---\n**References**\n${result.sources
+                .map((s, i) => `- [${i + 1}] ${s.title || s.url || ""}`)
+                .join("\n")}`
+            : "";
 
-        const aiText: TextMessage = {
+        const aiWeb: TextMessage = {
           id: crypto.randomUUID(),
           type: "ai",
-          content: cleaned || raw,
+          content: textOut + refs,
           timestamp: Date.now(),
         };
-        setMessages((prev) => (finalArray = [...prev, aiText]));
-
-        const withAi: Meta = {
-          ...payloadMeta,
-          history: [
-            ...payloadMeta.history,
-            { ts: Date.now(), user: question, ai: aiText.content },
-          ],
-        };
-        setMeta(withAi);
-
-        if (possiblePlan) {
-          latestPlan = possiblePlan;
-          const road: RoadmapMessage = {
-            id: crypto.randomUUID(),
-            type: "roadmap",
-            plan: possiblePlan,
-            note: roadmapLeadIn(possiblePlan),
-            timestamp: Date.now(),
-          };
-          setMessages((prev) => (finalArray = [...prev, road]));
-          await savePlanAsPathway({
-            plan: possiblePlan,
-            title: "Learning Path",
-            chatId,
-            status: "ACTIVE",
-          });
-        }
+        const finalArray = [...afterUser, aiWeb];
+        setMessages(finalArray);
 
         await saveChatSnapshot({
           chatId,
           messages: finalArray.filter(
             (m): m is TextMessage => m.type === "user" || m.type === "ai"
           ),
-          roadmap: latestPlan ?? null,
+          roadmap: null,
           titleFallback: afterUser.length <= 2 ? question.slice(0, 60) : null,
-          meta: withAi as any,
+          meta: newMeta as any,
         });
 
-        // After every normal answer, ask if they want practice
         setMessages((prev) => [
           ...prev,
           {
@@ -1608,6 +1679,184 @@ export default function ChatByIdPage() {
             timestamp: Date.now(),
           } as TextMessage,
         ]);
+
+        return;
+      } else {
+        // Non-web flow remains the same (route through classifier and general endpoint)
+        const verdict = await classifyPrompt(question);
+
+        let finalArray: ChatMessage[] = afterUser;
+        let latestPlan: Roadmap | null = null;
+
+        if (verdict.type === "roadmap") {
+          // AFTER
+          const md = buildPayloadMetadata(afterUser, null, newMeta, question);
+          const contextString = buildContextString({
+            chatId,
+            messages: afterUser,
+            meta: newMeta,
+            selectedTopic: selectedLearningTopic,
+            lastRoadmap: null,
+          });
+          const raw = await getAskRaw(
+            question,
+            contextString,
+            JSON.stringify(md)
+          );
+
+          const plan = tryExtractRoadmapFromText(raw);
+
+          if (!plan) {
+            const fallbackAI: TextMessage = {
+              id: crypto.randomUUID(),
+              type: "ai",
+              content: raw,
+              timestamp: Date.now(),
+            };
+            setMessages((prev) => (finalArray = [...prev, fallbackAI]));
+
+            const withAi: Meta = {
+              ...newMeta,
+              history: [
+                ...newMeta.history,
+                { ts: Date.now(), user: question, ai: raw },
+              ],
+            };
+            setMeta(withAi);
+
+            await saveChatSnapshot({
+              chatId,
+              messages: finalArray.filter(
+                (m): m is TextMessage => m.type === "user" || m.type === "ai"
+              ),
+              roadmap: null,
+              titleFallback:
+                afterUser.length <= 2 ? question.slice(0, 60) : null,
+              meta: withAi as any,
+            });
+          } else {
+            latestPlan = plan;
+
+            const lead: TextMessage = {
+              id: crypto.randomUUID(),
+              type: "ai",
+              content: roadmapLeadIn(plan),
+              timestamp: Date.now(),
+            };
+            const road: RoadmapMessage = {
+              id: crypto.randomUUID(),
+              type: "roadmap",
+              plan,
+              timestamp: Date.now(),
+            };
+            setMessages((prev) => (finalArray = [...prev, lead, road]));
+
+            const withAi: Meta = {
+              ...newMeta,
+              history: [
+                ...newMeta.history,
+                { ts: Date.now(), user: question, ai: lead.content },
+              ],
+            };
+            setMeta(withAi);
+
+            await savePlanAsPathway({
+              plan,
+              title: "Learning Path",
+              chatId,
+              status: "ACTIVE",
+            });
+
+            await saveChatSnapshot({
+              chatId,
+              messages: finalArray.filter(
+                (m): m is TextMessage => m.type === "user" || m.type === "ai"
+              ),
+              roadmap: latestPlan,
+              titleFallback:
+                afterUser.length <= 2 ? question.slice(0, 60) : null,
+              meta: withAi as any,
+            });
+          }
+        } else {
+          const payloadMeta = newMeta;
+          const metadata = buildPayloadMetadata(
+            afterUser,
+            null,
+            payloadMeta,
+            question
+          );
+
+          const result = await postJSON<any>(CHAT_POST, {
+            metadata,
+            prompt: question,
+            query: question,
+          });
+
+          const raw =
+            typeof result === "string"
+              ? result
+              : result?.text ?? JSON.stringify(result);
+          const possiblePlan = tryExtractRoadmapFromText(raw);
+          const cleaned = stripRoadmapJsonFromText(raw);
+
+          const aiText: TextMessage = {
+            id: crypto.randomUUID(),
+            type: "ai",
+            content: cleaned || raw,
+            timestamp: Date.now(),
+          };
+          setMessages((prev) => (finalArray = [...prev, aiText]));
+
+          const withAi: Meta = {
+            ...payloadMeta,
+            history: [
+              ...payloadMeta.history,
+              { ts: Date.now(), user: question, ai: aiText.content },
+            ],
+          };
+          setMeta(withAi);
+
+          if (possiblePlan) {
+            latestPlan = possiblePlan;
+            const road: RoadmapMessage = {
+              id: crypto.randomUUID(),
+              type: "roadmap",
+              plan: possiblePlan,
+              note: roadmapLeadIn(possiblePlan),
+              timestamp: Date.now(),
+            };
+            setMessages((prev) => (finalArray = [...prev, road]));
+            await savePlanAsPathway({
+              plan: possiblePlan,
+              title: "Learning Path",
+              chatId,
+              status: "ACTIVE",
+            });
+          }
+
+          await saveChatSnapshot({
+            chatId,
+            messages: finalArray.filter(
+              (m): m is TextMessage => m.type === "user" || m.type === "ai"
+            ),
+            roadmap: latestPlan ?? null,
+            titleFallback: afterUser.length <= 2 ? question.slice(0, 60) : null,
+            meta: withAi as any,
+          });
+
+          // After every normal answer, ask if they want practice
+          setMessages((prev) => [
+            ...prev,
+            {
+              id: crypto.randomUUID(),
+              type: "ai",
+              content:
+                "Would you like me to quiz you on this? I can give you 2 MCQs + 1 short question and adapt if needed.",
+              timestamp: Date.now(),
+            } as TextMessage,
+          ]);
+        }
       }
     } catch (e: any) {
       const msg = e?.message ?? "Unknown error";
@@ -1660,30 +1909,27 @@ export default function ChatByIdPage() {
 
       <Header />
 
-      <div className="flex-1 flex overflow-hidden">
+      {/* BELOW <Header /> */}
+      <div className="h-[calc(100vh-56px)] grid grid-cols-1 lg:grid-cols-2 gap-0 bg-[#0b0b0c] overflow-hidden">
         {/* Left: Chat */}
-        <div
-          className={`${
-            isLearningMode ? "w-full lg:w-1/2" : "w-full"
-          } flex flex-col transition-all duration-300`}
-        >
+        <div className="col-span-1 flex flex-col overflow-hidden">
           <main
-            className={`flex-1 overflow-y-auto px-4 py-6 ${
+            className={`flex-1 overflow-y-auto overscroll-contain px-4 py-6 ${
               isLearningMode ? "max-w-none" : "mx-auto max-w-3xl"
-            }`}
+            } scroll-smooth`}
           >
             {/* Empty-state hero */}
             {messages.length <= 1 && (
               <div className="mx-auto max-w-3xl mb-6">
-                <div className="rounded-2xl border border-neutral-800 bg-neutral-950/60 shadow-[0_0_0_1px_rgba(255,255,255,0.02)] backdrop-blur p-6 md:p-7 space-y-2 text-center">
-                  <div className="inline-flex items-center gap-2 rounded-full border border-neutral-800 bg-neutral-900/60 px-3 py-1 text-[11px] text-neutral-400">
-                    <Sparkles size={14} /> Intelligent assistance, minimal noise
+                <div className="rounded-xl border border-neutral-900 bg-neutral-950/60 p-6 md:p-7 space-y-2 text-center">
+                  <div className="inline-flex items-center gap-2 rounded-full border border-neutral-900 bg-neutral-950 px-3 py-1 text-[11px] text-neutral-400">
+                    <Sparkles size={14} /> Minimal, fast, focused
                   </div>
                   <h1 className="text-2xl md:text-3xl font-semibold tracking-tight">
                     Start learning today
                   </h1>
                   <p className="text-sm text-neutral-400">
-                    Ask for a roadmap or upload a PDF to get tailored practice.
+                    Ask for a roadmap or upload a PDF for tailored practice.
                   </p>
                 </div>
               </div>
@@ -1698,13 +1944,23 @@ export default function ChatByIdPage() {
             </div>
           </main>
 
+          {/* Composer stays docked inside the left pane only */}
           <ChatInput
             currentMessage={currentMessage}
             setCurrentMessage={setCurrentMessage}
             onSend={handleSend}
-            onPickPdf={addAttachment}
+            onPickPdf={(file) =>
+              setAttachments((prev) => {
+                const exists = prev.some(
+                  (f) => f.name === file.name && f.size === file.size
+                );
+                return exists ? prev : [...prev, file];
+              })
+            }
             attachments={attachments}
-            onRemoveAttachment={removeAttachment}
+            onRemoveAttachment={(index) =>
+              setAttachments((prev) => prev.filter((_, i) => i !== index))
+            }
             disabled={
               !chatId || (!currentMessage.trim() && attachments.length === 0)
             }
@@ -1713,75 +1969,77 @@ export default function ChatByIdPage() {
             onTogglePractice={() =>
               selectedLearningTopic ? closeLearningContent() : null
             }
+            useWebSearch={useWebSearch}
+            setUseWebSearch={setUseWebSearch}
           />
         </div>
 
-        {/* Right: Practice Panel */}
+        {/* Right: Practice Panel (independent scroll) */}
         {isLearningMode && selectedLearningTopic && (
-          <div className="hidden lg:block w-1/2 h-full overflow-y-auto border-l border-neutral-900/70 p-4 space-y-4 bg-[#0b0b0c]/60 backdrop-blur">
-            <div className="flex items-center justify-between">
+          <aside className="hidden lg:flex flex-col overflow-hidden border-l border-neutral-900/70 bg-[#0b0b0c]">
+            <div className="shrink-0 flex items-center justify-between px-4 py-3 border-b border-neutral-900/70 bg-[#0b0b0c]">
               <h3 className="font-semibold text-neutral-200 flex items-center gap-2">
                 <BookOpen size={16} className="text-neutral-400" />
                 {selectedLearningTopic.subtopicName}
               </h3>
               <button
                 onClick={closeLearningContent}
-                className="text-neutral-500 hover:text-neutral-300 text-sm px-2 py-1 rounded hover:bg-neutral-800"
+                className="text-neutral-500 hover:text-neutral-300 text-sm px-2 py-1 rounded hover:bg-neutral-900"
               >
                 ✕ Close
               </button>
             </div>
 
-            {/* Study content (API) */}
-            <LearningContent query={selectedLearningTopic.subtopicName} />
+            {/* Make this the scroller */}
+            <div className="grow overflow-y-auto overscroll-contain p-4 space-y-4 scroll-smooth">
+              <LearningContent query={selectedLearningTopic.subtopicName} />
 
-            {/* NEW practice flow */}
-            <PracticePanel
-              chatId={chatId!}
-              topic={selectedLearningTopic.topicName}
-              subtopic={selectedLearningTopic.subtopicName}
-              onAppendMessage={(m) =>
-                setMessages((prev) => [
-                  ...prev,
-                  {
-                    id: crypto.randomUUID(),
-                    type: "ai",
-                    content: m.content,
-                    timestamp: Date.now(),
-                  },
-                ])
-              }
-              onAppendPerfEvent={async (ev) => {
-                setMeta((prev) => ({
-                  ...prev,
-                  performance: [
-                    ...prev.performance,
+              <PracticePanel
+                chatId={chatId!}
+                topic={selectedLearningTopic.topicName}
+                subtopic={selectedLearningTopic.subtopicName}
+                onAppendMessage={(m) =>
+                  setMessages((prev) => [
+                    ...prev,
                     {
-                      ts: Date.now(),
-                      kind: ev.kind,
-                      question: ev.question,
-                      accuracy: ev.accuracy,
+                      id: crypto.randomUUID(),
+                      type: "ai",
+                      content: m.content,
+                      timestamp: Date.now(),
                     },
-                  ],
-                }));
-                if (chatId) {
-                  await appendPerformanceEvent({
-                    chatId,
-                    event: {
-                      ts: Date.now(),
-                      kind: ev.kind,
-                      question: ev.question,
-                      accuracy: ev.accuracy,
-                      details: ev.details,
-                    },
-                  });
+                  ])
                 }
-              }}
-            />
+                onAppendPerfEvent={async (ev) => {
+                  setMeta((prev) => ({
+                    ...prev,
+                    performance: [
+                      ...prev.performance,
+                      {
+                        ts: Date.now(),
+                        kind: ev.kind,
+                        question: ev.question,
+                        accuracy: ev.accuracy,
+                      },
+                    ],
+                  }));
+                  if (chatId) {
+                    await appendPerformanceEvent({
+                      chatId,
+                      event: {
+                        ts: Date.now(),
+                        kind: ev.kind,
+                        question: ev.question,
+                        accuracy: ev.accuracy,
+                        details: ev.details,
+                      },
+                    });
+                  }
+                }}
+              />
 
-            {/* YouTube */}
-            <YoutubeRecs topic={selectedLearningTopic.subtopicName} />
-          </div>
+              <YoutubeRecs topic={selectedLearningTopic.subtopicName} />
+            </div>
+          </aside>
         )}
       </div>
     </div>
