@@ -1,3 +1,4 @@
+// src/components/Text.tsx
 "use client";
 
 import { useState } from "react";
@@ -8,12 +9,15 @@ export type TextAnswerCardProps = {
   context?: string;
   /** Optional: disable server grading (for demos/offline) */
   disableGrading?: boolean;
+  /** Notify parent so we can update meta.performance */
+  onGraded?: (payload: { question: string; score: number }) => void;
 };
 
 export function TextAnswerCard({
   prompt,
   context,
   disableGrading = false,
+  onGraded,
 }: TextAnswerCardProps) {
   const [answer, setAnswer] = useState("");
   const [submitting, setSubmitting] = useState(false);
@@ -33,12 +37,14 @@ export function TextAnswerCard({
       if (disableGrading) {
         const score =
           content.length > 60 ? 0.8 : content.length > 25 ? 0.6 : 0.4;
-        setRes({
+        const out = {
           score,
           verdict: score >= 0.6 ? "PASS" : "REVISE",
           feedback:
             "Demo mode: heuristic grade. Provide more specifics and examples to increase your score.",
-        });
+        };
+        setRes(out);
+        onGraded?.({ question: prompt, score: out.score });
       } else {
         const out = await gradeText({ prompt, userAnswer: content, context });
         setRes({
@@ -46,6 +52,7 @@ export function TextAnswerCard({
           verdict: out.verdict,
           feedback: out.feedback,
         });
+        onGraded?.({ question: prompt, score: out.score });
       }
     } catch (e: any) {
       setErr(e?.message ?? "Failed to grade.");

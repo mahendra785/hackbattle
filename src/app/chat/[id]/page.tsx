@@ -4,19 +4,33 @@
 import Image from "next/image";
 import { useEffect, useMemo, useRef, useState } from "react";
 import * as d3 from "d3";
-import { Send } from "lucide-react";
+import {
+  Send,
+  Sparkles,
+  BookOpen,
+  Brain,
+  ChevronRight,
+  PanelRightClose,
+  PanelRightOpen,
+} from "lucide-react";
 import { useSession } from "next-auth/react";
-import { saveChatSnapshot } from "@/app/actions/chat";
-import { savePlanAsPathway } from "@/app/actions/pathway";
+import { useParams } from "next/navigation";
+
+import {
+  saveChatSnapshot,
+  savePlanAsPathway,
+  getChatSnapshot,
+} from "@/app/actions/chat";
 import { classifyPrompt } from "@/app/actions/nlu";
 import {
   generatePractice,
   type GeneratedMCQ,
   type GeneratedTextQ,
 } from "@/app/actions/quiz";
-import { useParams } from "next/navigation";
-import MCQCard from "../../../components/mcq";
-import TextAnswerCard from "../../../components/Text";
+import { appendPerformanceEvent } from "@/app/actions/progress";
+
+import MCQCard from "../../../components/mcq"; // (kept for compatibility; not used by the new panel)
+import TextAnswerCard from "../../../components/Text"; // (kept for compatibility; not used by the new panel)
 import YoutubeRecs from "../../../components/YoutubeRecs";
 
 /* =========================
@@ -25,13 +39,21 @@ import YoutubeRecs from "../../../components/YoutubeRecs";
 type BaseMessage = { id: string; timestamp: number };
 type TextMessage = BaseMessage & { type: "user" | "ai"; content: string };
 
-type RoadmapSubtopic = { type: "SUBTOPIC"; name: string };
+type RoadmapSubtopic = { type: "SUBTOPIC"; name: string; content?: string };
 type RoadmapTopic = {
   type: "TOPIC";
   name: string;
   subtopics: RoadmapSubtopic[];
 };
 type Roadmap = RoadmapTopic[];
+
+type PdfQueryResponse = {
+  query: string;
+  answer: string | Roadmap; // backend may return plain text or a roadmap
+  context_used?: string;
+  source?: string;
+  metadata_patch?: SourceDoc;
+};
 
 type RoadmapMessage = BaseMessage & {
   type: "roadmap";
@@ -42,6 +64,27 @@ type ChatMessage = TextMessage | RoadmapMessage;
 
 type ContentItem = { type: string; content: string };
 
+type SourceDoc = {
+  type: "pdf";
+  filename: string;
+  context_excerpt: string;
+  context_hash: string;
+  bytes_used?: number;
+  source?: string;
+};
+
+// Long-term learning context
+type Meta = {
+  history: Array<{ ts: number; user: string; ai?: string }>;
+  performance: Array<{
+    ts: number;
+    kind: "mcq" | "text";
+    question: string;
+    accuracy: number; // 0..1
+  }>;
+  sources?: SourceDoc[];
+};
+
 /* =========================
    Config
 ========================= */
@@ -49,6 +92,7 @@ const API_BASE = "https://retiform-leonida-stifledly.ngrok-free.dev";
 const ROADMAP_GET = (q: string) =>
   `${API_BASE}/ask?q=${encodeURIComponent(q)}&_ngrok_skip_browser_warning=true`;
 const CHAT_POST = `${API_BASE}/general`;
+const PDF_QUERY_POST = `${API_BASE}/pdf/query`;
 
 /* =========================
    Helpers
@@ -90,10 +134,15 @@ function roadmapLeadIn(plan: Roadmap): string {
     " → "
   )}${tail}). Click a topic to explore subtopics.`;
 }
-function buildMetadata(messages: ChatMessage[], latestPlan?: Roadmap | null) {
+function buildPayloadMetadata(
+  messages: ChatMessage[],
+  latestPlan: Roadmap | null,
+  meta: Meta
+) {
   return {
     events: [],
     roadmap: latestPlan ?? [],
+    meta,
     messages: messages
       .filter((m): m is TextMessage => m.type === "user" || m.type === "ai")
       .map((m) => ({
@@ -105,42 +154,73 @@ function buildMetadata(messages: ChatMessage[], latestPlan?: Roadmap | null) {
   };
 }
 
+async function askPdfQuery(
+  file: File,
+  question: string
+): Promise<PdfQueryResponse> {
+  const fd = new FormData();
+  fd.append("file", file);
+  fd.append("query", question || "Summarize key ideas and definitions.");
+
+  const res = await fetch(PDF_QUERY_POST, {
+    method: "POST",
+    body: fd,
+    headers: { "ngrok-skip-browser-warning": "true" },
+    mode: "cors",
+  });
+
+  const text = await res.text();
+  const ct = res.headers.get("content-type") || "";
+  if (ct.includes("text/html") || text.includes("ERR_NGROK_6024")) {
+    throw new Error("Ngrok splash intercepted the request.");
+  }
+  if (!res.ok) {
+    throw new Error(`Backend error ${res.status}: ${text.substring(0, 200)}`);
+  }
+  return JSON.parse(text) as PdfQueryResponse;
+}
+
 /* =========================
    Header
 ========================= */
 function Header() {
   const { data: session } = useSession();
   return (
-    <header className="sticky top-0 z-10 border-b border-neutral-900 bg-neutral-950/80 backdrop-blur">
-      <div className="mx-auto max-w-6xl px-4 py-3 flex items-center justify-between">
+    <header className="sticky top-0 z-10 border-b border-neutral-900/70 bg-[#0b0b0c]/80 backdrop-blur">
+      <div className="mx-auto max-w-5xl px-4 py-3 flex items-center justify-between">
         <div className="flex items-center gap-2">
-          <div className="h-8 w-8 rounded-md bg-orange-500 grid place-items-center">
-            <span className="text-xs font-semibold">AI</span>
+          <div className="h-7 w-7 rounded-md bg-gradient-to-br from-amber-400/80 via-amber-500 to-amber-600 grid place-items-center shadow-[0_0_0_1px_rgba(255,193,7,0.25)]">
+            <Sparkles size={14} className="text-black" />
           </div>
           <span className="text-sm text-neutral-300">Learning Copilot</span>
         </div>
-        {session?.user ? (
-          <div className="flex items-center gap-2">
-            <span className="text-sm text-neutral-300">
-              {session.user.name}
-            </span>
+        <div className="flex items-center gap-2">
+          <div className="hidden sm:flex items-center gap-2 text-[11px] text-neutral-500 border border-neutral-800 rounded-full px-2 py-1">
+            <Brain size={12} /> Smarter with your progress
+          </div>
+          {session?.user ? (
+            <>
+              <span className="text-sm text-neutral-300 hidden sm:block">
+                {session.user.name}
+              </span>
+              <Image
+                src={session.user.image || "/default-avatar.png"}
+                alt={session.user.name || "User"}
+                width={28}
+                height={28}
+                className="rounded-full"
+              />
+            </>
+          ) : (
             <Image
-              src={session.user.image || "/default-avatar.png"}
-              alt={session.user.name || "User"}
+              src="/default-avatar.png"
+              alt="Guest"
               width={28}
               height={28}
               className="rounded-full"
             />
-          </div>
-        ) : (
-          <Image
-            src="/default-avatar.png"
-            alt="Guest"
-            width={28}
-            height={28}
-            className="rounded-full"
-          />
-        )}
+          )}
+        </div>
       </div>
     </header>
   );
@@ -148,7 +228,7 @@ function Header() {
 
 /* =========================
    Learning Content (RIGHT PANEL)
-/* pulls /content/?q=... and shows above practice */
+========================= */
 function LearningContent({ query }: { query: string }) {
   const [items, setItems] = useState<ContentItem[] | null>(null);
   const [loading, setLoading] = useState(false);
@@ -197,7 +277,7 @@ function LearningContent({ query }: { query: string }) {
 
   if (loading) {
     return (
-      <div className="rounded-xl border border-neutral-800 bg-neutral-900 p-4">
+      <div className="rounded-2xl border border-neutral-800 bg-neutral-900 p-4">
         <div className="flex items-center gap-2 text-sm text-neutral-400">
           <div className="h-2 w-2 rounded-full bg-neutral-500 animate-pulse" />
           Loading study materials…
@@ -208,7 +288,7 @@ function LearningContent({ query }: { query: string }) {
 
   if (err) {
     return (
-      <div className="rounded-xl border border-red-900/40 bg-red-950/40 p-4 text-sm text-red-300">
+      <div className="rounded-2xl border border-red-900/40 bg-red-950/40 p-4 text-sm text-red-300">
         {err}
       </div>
     );
@@ -216,26 +296,24 @@ function LearningContent({ query }: { query: string }) {
 
   if (!items || items.length === 0) {
     return (
-      <div className="rounded-xl border border-neutral-800 bg-neutral-900 p-4 text-sm text-neutral-400">
+      <div className="rounded-2xl border border-neutral-800 bg-neutral-900 p-4 text-sm text-neutral-400">
         No study materials found for this topic.
       </div>
     );
   }
 
   return (
-    <div className="rounded-xl border border-neutral-800 bg-neutral-900 overflow-hidden">
-      <div className="px-4 py-3 border-b border-neutral-800 bg-neutral-900/60">
+    <div className="rounded-2xl border border-neutral-800 bg-neutral-900 overflow-hidden">
+      <div className="px-4 py-3 border-b border-neutral-800 bg-neutral-900/60 flex items-center gap-2">
+        <BookOpen size={16} className="text-neutral-400" />
         <div className="text-sm font-semibold text-neutral-100">
           Study materials
         </div>
-        <div className="text-xs text-neutral-500">{query}</div>
+        <div className="text-xs text-neutral-500">· {query}</div>
       </div>
       <div className="divide-y divide-neutral-800">
         {items.map((it, idx) => (
           <div key={idx} className="p-4 space-y-1.5">
-            <div className="text-[11px] uppercase tracking-wide text-neutral-400">
-              {it.type}
-            </div>
             <div className="text-sm whitespace-pre-wrap text-neutral-200">
               {it.content}
             </div>
@@ -247,7 +325,7 @@ function LearningContent({ query }: { query: string }) {
 }
 
 /* =========================
-   D3 Roadmap (unchanged)
+   D3 Roadmap (visual polish)
 ========================= */
 function InteractiveRoadmap({
   roadmap,
@@ -271,12 +349,12 @@ function InteractiveRoadmap({
     type Link = { source: string; target: string };
     const n: Node[] = [];
     const l: Link[] = [];
-    const gapX = 180;
-    const centerY = 100;
+    const gapX = 190;
+    const centerY = 110;
 
     roadmap.forEach((topic, i) => {
       const topicId = `topic_${i}`;
-      const x = 100 + i * gapX;
+      const x = 120 + i * gapX;
       n.push({ id: topicId, label: topic.name, index: i, x, y: centerY });
       if (i > 0) l.push({ source: `topic_${i - 1}`, target: topicId });
     });
@@ -288,7 +366,7 @@ function InteractiveRoadmap({
     if (!wrapperRef.current) return;
     const wrapper = wrapperRef.current;
     const width = wrapper.clientWidth;
-    const height = 200;
+    const height = 220;
 
     let svg = d3.select(svgRef.current);
     if (svg.empty()) {
@@ -303,8 +381,19 @@ function InteractiveRoadmap({
       .attr("viewBox", `0 0 ${width} ${height}`);
     svg.selectAll("*").remove();
 
-    svg
-      .append("defs")
+    // gradient defs
+    const defs = svg.append("defs");
+    const grad = defs
+      .append("linearGradient")
+      .attr("id", "edgeGrad")
+      .attr("x1", "0%")
+      .attr("y1", "0%")
+      .attr("x2", "100%")
+      .attr("y2", "0%");
+    grad.append("stop").attr("offset", "0%").attr("stop-color", "#f59e0b");
+    grad.append("stop").attr("offset", "100%").attr("stop-color", "#f97316");
+
+    defs
       .append("marker")
       .attr("id", "arrow")
       .attr("viewBox", "0 -5 10 10")
@@ -315,12 +404,12 @@ function InteractiveRoadmap({
       .attr("orient", "auto")
       .append("path")
       .attr("d", "M0,-5L10,0L0,5")
-      .attr("fill", "#f97316");
+      .attr("fill", "#f59e0b");
 
     const g = svg.append("g");
     const zoom = d3
       .zoom<SVGSVGElement, unknown>()
-      .scaleExtent([0.5, 2])
+      .scaleExtent([0.7, 2])
       .on("zoom", (e) => g.attr("transform", e.transform));
     svg.call(zoom as any);
 
@@ -329,12 +418,12 @@ function InteractiveRoadmap({
       .enter()
       .append("line")
       .attr("class", "link")
-      .attr("stroke", "#f97316")
+      .attr("stroke", "url(#edgeGrad)")
       .attr("stroke-width", 2)
       .attr("marker-end", "url(#arrow)")
-      .attr("x1", (d) => nodes.find((n) => n.id === d.source)!.x + 35)
+      .attr("x1", (d) => nodes.find((n) => n.id === d.source)!.x + 40)
       .attr("y1", (d) => nodes.find((n) => n.id === d.source)!.y)
-      .attr("x2", (d) => nodes.find((n) => n.id === d.target)!.x - 35)
+      .attr("x2", (d) => nodes.find((n) => n.id === d.target)!.x - 40)
       .attr("y2", (d) => nodes.find((n) => n.id === d.target)!.y);
 
     const nodeGroup = g
@@ -347,18 +436,18 @@ function InteractiveRoadmap({
 
     nodeGroup
       .append("circle")
-      .attr("r", 35)
-      .attr("fill", (d) => (selectedTopic === d.index ? "#f97316" : "#111827"))
-      .attr("stroke", "#f97316")
+      .attr("r", 38)
+      .attr("fill", (d) => (selectedTopic === d.index ? "#f59e0b" : "#111827"))
+      .attr("stroke", "#f59e0b")
       .attr("stroke-width", 2)
       .style("cursor", "pointer")
       .on("mouseover", function () {
-        d3.select(this).attr("fill", "#f97316").attr("r", 38);
+        d3.select(this).attr("fill", "#f59e0b").attr("r", 40);
       })
       .on("mouseout", function (_e, d: any) {
         d3.select(this)
-          .attr("fill", selectedTopic === d.index ? "#f97316" : "#111827")
-          .attr("r", 35);
+          .attr("fill", selectedTopic === d.index ? "#f59e0b" : "#111827")
+          .attr("r", 38);
       })
       .on("click", function (_e, d: any) {
         setSelectedTopic(selectedTopic === d.index ? null : d.index);
@@ -370,7 +459,7 @@ function InteractiveRoadmap({
       .attr("dominant-baseline", "middle")
       .attr("font-size", "11px")
       .attr("fill", "#ffffff")
-      .attr("font-weight", "500")
+      .attr("font-weight", "600")
       .style("pointer-events", "none")
       .each(function (d: any) {
         const text = d3.select(this);
@@ -395,7 +484,7 @@ function InteractiveRoadmap({
       });
 
     const totalWidth =
-      nodes.length > 0 ? Math.max(...nodes.map((n) => n.x)) + 100 : width;
+      nodes.length > 0 ? Math.max(...nodes.map((n) => n.x)) + 130 : width;
     if (totalWidth > width) {
       svg.attr("viewBox", `0 0 ${totalWidth} ${height}`);
       let isScrolling = false,
@@ -443,14 +532,14 @@ function InteractiveRoadmap({
     <div className="space-y-4">
       <div
         ref={wrapperRef}
-        className="w-full h-48 overflow-hidden rounded-xl border border-neutral-800 bg-gradient-to-br from-neutral-900 to-neutral-950 shadow-lg"
+        className="w-full h-56 overflow-hidden rounded-2xl border border-neutral-800 bg-gradient-to-br from-neutral-900 to-neutral-950 shadow-[0_0_0_1px_rgba(255,255,255,0.03)]"
       />
       {selectedTopic !== null && roadmap[selectedTopic] && (
-        <div className="rounded-xl border border-orange-500/20 bg-gradient-to-br from-neutral-900 to-neutral-950 shadow-lg overflow-hidden">
-          <div className="bg-gradient-to-r from-orange-500/10 to-transparent p-4 border-b border-orange-500/20">
+        <div className="rounded-2xl border border-amber-500/20 bg-gradient-to-br from-neutral-900 to-neutral-950 shadow-[0_0_0_1px_rgba(255,193,7,0.12)] overflow-hidden">
+          <div className="bg-gradient-to-r from-amber-500/10 to-transparent p-4 border-b border-amber-500/20">
             <div className="flex items-center gap-2">
-              <div className="w-2 h-2 bg-orange-500 rounded-full" />
-              <h3 className="font-semibold text-orange-400">
+              <div className="w-2 h-2 bg-amber-500 rounded-full" />
+              <h3 className="font-semibold text-amber-400">
                 {roadmap[selectedTopic].name}
               </h3>
               <span className="text-xs text-neutral-500 ml-2">
@@ -468,10 +557,11 @@ function InteractiveRoadmap({
                     onSubtopicClick(roadmap[selectedTopic].name, subtopic.name)
                   }
                 >
-                  <div className="w-1.5 h-1.5 rounded-full bg-orange-400 group-hover:bg-orange-300 transition-colors duration-200 flex-shrink-0" />
+                  <div className="w-1.5 h-1.5 rounded-full bg-amber-400 group-hover:bg-amber-300 transition-colors duration-200 flex-shrink-0" />
                   <span className="group-hover:text-neutral-200 transition-colors duration-200">
                     {subtopic.name}
                   </span>
+                  <ChevronRight size={14} className="ml-auto opacity-40" />
                 </div>
               ))}
             </div>
@@ -489,7 +579,7 @@ function InteractiveRoadmap({
 }
 
 /* =========================
-   Chat Messages (supports roadmap)
+   Chat Messages
 ========================= */
 function ChatMessages({
   messages,
@@ -506,20 +596,18 @@ function ChatMessages({
   }, [messages, isTyping]);
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-5">
       {messages.map((m) => {
         if (m.type === "roadmap") {
           const rm = m as RoadmapMessage;
           return (
-            <div key={m.id} className="space-y-2">
+            <div key={m.id} className="space-y-3">
               {rm.note && (
                 <div className="flex gap-3 w-full">
-                  <div className="h-8 w-8 rounded-full bg-neutral-800 grid place-items-center flex-shrink-0">
-                    <span className="text-orange-400 text-xs font-semibold">
-                      AI
-                    </span>
+                  <div className="h-8 w-8 rounded-full bg-neutral-900 border border-neutral-800 grid place-items-center flex-shrink-0">
+                    <Sparkles size={14} className="text-amber-400" />
                   </div>
-                  <div className="flex-1 rounded-2xl bg-neutral-900 border border-neutral-800 px-4 py-3 leading-relaxed whitespace-pre-wrap">
+                  <div className="flex-1 rounded-2xl bg-neutral-900/70 border border-neutral-800 px-4 py-3 leading-relaxed whitespace-pre-wrap">
                     {rm.note}
                   </div>
                 </div>
@@ -533,28 +621,34 @@ function ChatMessages({
         }
 
         const tm = m as TextMessage;
-        return tm.type === "ai" ? (
+        const isAI = tm.type === "ai";
+        return isAI ? (
           <div key={m.id} className="flex gap-3 w-full">
-            <div className="h-8 w-8 rounded-full bg-neutral-800 grid place-items-center flex-shrink-0">
-              <span className="text-orange-400 text-xs font-semibold">AI</span>
+            <div className="h-8 w-8 rounded-full bg-neutral-900 border border-neutral-800 grid place-items-center flex-shrink-0">
+              <Sparkles size={14} className="text-amber-400" />
             </div>
-            <div className="flex-1 rounded-2xl bg-neutral-900 border border-neutral-800 px-4 py-3 leading-relaxed whitespace-pre-wrap">
+            <div className="flex-1 rounded-2xl bg-neutral-900/70 border border-neutral-800 px-4 py-3 leading-relaxed whitespace-pre-wrap">
               {tm.content}
             </div>
           </div>
         ) : (
-          <div
-            key={m.id}
-            className="ml-auto max-w-[80%] rounded-2xl bg-orange-500 text-white px-4 py-3 leading-relaxed whitespace-pre-wrap"
-          >
-            {tm.content}
+          <div key={m.id} className="flex w-full justify-end">
+            <div className="max-w-[75%] rounded-2xl bg-gradient-to-b from-amber-500 to-amber-600 text-black px-4 py-3 leading-relaxed whitespace-pre-wrap shadow">
+              {tm.content}
+            </div>
           </div>
         );
       })}
       {isTyping && (
         <div className="flex gap-3 items-center text-neutral-400">
-          <div className="h-2 w-2 rounded-full bg-neutral-500 animate-pulse" />
-          <div className="text-sm">AI is typing…</div>
+          <div className="h-8 w-8 rounded-full bg-neutral-900 border border-neutral-800 grid place-items-center flex-shrink-0">
+            <Sparkles size={14} className="text-amber-400" />
+          </div>
+          <div className="flex items-center gap-1 text-sm">
+            <span className="inline-flex h-1.5 w-1.5 rounded-full bg-neutral-500 animate-bounce [animation-delay:-.2s]" />
+            <span className="inline-flex h-1.5 w-1.5 rounded-full bg-neutral-500 animate-bounce" />
+            <span className="inline-flex h-1.5 w-1.5 rounded-full bg-neutral-500 animate-bounce [animation-delay:.2s]" />
+          </div>
         </div>
       )}
       <div ref={endRef} />
@@ -563,58 +657,492 @@ function ChatMessages({
 }
 
 /* =========================
-   Chat Input
+   Quick Chips
+========================= */
+function QuickChips({ onPick }: { onPick: (s: string) => void }) {
+  const chips = [
+    "Create a roadmap for React",
+    "Explain closures with examples",
+    "Design a 2-week DSA plan",
+    "Summarize GraphQL vs REST",
+  ];
+  return (
+    <div className="flex flex-wrap gap-2 px-1 mb-2">
+      {chips.map((c) => (
+        <button
+          key={c}
+          onClick={() => onPick(c)}
+          className="text-[11px] px-2 py-1 rounded-full border border-neutral-800 bg-neutral-900/80 hover:bg-neutral-900 text-neutral-400"
+        >
+          {c}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+/* =========================
+   Chat Input (textarea prompt + attachments)
 ========================= */
 function ChatInput({
   currentMessage,
   setCurrentMessage,
   onSend,
+  onPickPdf,
+  attachments,
+  onRemoveAttachment,
   disabled,
+  showPracticeToggle,
+  practiceOpen,
+  onTogglePractice,
 }: {
   currentMessage: string;
   setCurrentMessage: (message: string) => void;
   onSend: (text: string) => void;
+  onPickPdf: (file: File) => void;
+  attachments: File[];
+  onRemoveAttachment: (index: number) => void;
   disabled: boolean;
+  showPracticeToggle: boolean;
+  practiceOpen: boolean;
+  onTogglePractice: () => void;
 }) {
+  const fileRef = useRef<HTMLInputElement | null>(null);
+
   return (
-    <div className="border-t border-neutral-800 bg-gradient-to-t from-neutral-950 via-neutral-950/95 to-transparent p-4">
-      <div className="rounded-2xl border border-neutral-800 bg-neutral-900 focus-within:ring-1 focus-within:ring-orange-500">
-        <textarea
-          rows={1}
-          className="w-full resize-none bg-transparent px-4 py-3 outline-none"
-          placeholder='Ask anything… e.g. "Create a learning roadmap for Machine Learning"'
-          value={currentMessage}
-          onChange={(e) => setCurrentMessage(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter" && !e.shiftKey) {
-              e.preventDefault();
-              const text = currentMessage.trim();
-              if (text) onSend(text);
-            }
-          }}
-        />
-        <div className="flex items-center justify-end px-2 pb-2">
-          <button
-            onClick={() => {
-              const text = currentMessage.trim();
-              if (text) onSend(text);
+    <div className="border-t border-neutral-900 bg-gradient-to-t from-[#0a0a0b] via-[#0a0a0b]/95 to-transparent p-4">
+      <div className="mx-auto max-w-3xl">
+        <QuickChips onPick={(s) => setCurrentMessage(s)} />
+
+        <div className="rounded-2xl border border-neutral-800 bg-neutral-900 focus-within:ring-1 focus-within:ring-amber-500/60 overflow-hidden">
+          {/* Textarea */}
+          <textarea
+            rows={1}
+            className="w-full resize-none bg-transparent px-4 py-3 outline-none"
+            placeholder='Ask anything… e.g. "Create a learning roadmap for Machine Learning"'
+            value={currentMessage}
+            onChange={(e) => setCurrentMessage(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && !e.shiftKey) {
+                e.preventDefault();
+                const text = currentMessage.trim();
+                if (text || attachments.length > 0) onSend(text);
+              }
             }}
-            disabled={disabled}
+          />
+
+          {/* Attachment chips (PDFs) */}
+          {attachments.length > 0 && (
+            <div className="px-3 pb-2 flex flex-wrap gap-2">
+              {attachments.map((f, i) => (
+                <div
+                  key={`${f.name}-${f.size}-${i}`}
+                  className="flex items-center gap-2 text-xs rounded-lg border border-neutral-800 bg-neutral-900 px-2 py-1"
+                  title={f.name}
+                >
+                  <BookOpen size={12} className="text-neutral-400" />
+                  <span className="text-neutral-300 max-w-[220px] truncate">
+                    {f.name}
+                  </span>
+                  <button
+                    onClick={() => onRemoveAttachment(i)}
+                    className="text-neutral-500 hover:text-neutral-200"
+                    aria-label="Remove attachment"
+                  >
+                    ✕
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* Toolbar */}
+          <div className="flex items-center justify-between px-2 pb-2">
+            <div className="flex items-center gap-2 text-[11px] text-neutral-500 pl-2">
+              <span className="rounded-full border border-neutral-800 bg-neutral-900 px-2 py-1">
+                Roadmaps • Practice • Videos
+              </span>
+
+              {/* Upload PDF */}
+              <button
+                type="button"
+                onClick={() => fileRef.current?.click()}
+                className="ml-2 inline-flex items-center gap-1 rounded-lg px-2.5 py-1.5 text-xs border border-neutral-800 bg-neutral-900 hover:bg-neutral-800 text-neutral-300"
+                title="Upload PDF"
+              >
+                <BookOpen size={14} /> Upload PDF
+              </button>
+              <input
+                ref={fileRef}
+                type="file"
+                accept="application/pdf"
+                className="hidden"
+                onChange={(e) => {
+                  const f = e.target.files?.[0];
+                  if (f) onPickPdf(f); // just attach; we use ONLY the textarea prompt when sending
+                  e.currentTarget.value = ""; // allow re-selecting same file
+                }}
+              />
+            </div>
+
+            <div className="flex items-center gap-2">
+              {showPracticeToggle && (
+                <button
+                  onClick={onTogglePractice}
+                  className="inline-flex items-center gap-1 rounded-lg px-2.5 py-1.5 text-xs border border-neutral-800 bg-neutral-900 hover:bg-neutral-800 text-neutral-300"
+                >
+                  {practiceOpen ? (
+                    <>
+                      <PanelRightClose size={14} /> Hide panel
+                    </>
+                  ) : (
+                    <>
+                      <PanelRightOpen size={14} /> Show panel
+                    </>
+                  )}
+                </button>
+              )}
+
+              <button
+                onClick={() => {
+                  const text = currentMessage.trim();
+                  if (text || attachments.length > 0) onSend(text);
+                }}
+                disabled={disabled}
+                className={`inline-flex items-center gap-2 rounded-lg px-3 py-2 text-sm font-medium ${
+                  !disabled
+                    ? "bg-gradient-to-b from-amber-500 to-amber-600 text-black hover:brightness-105"
+                    : "bg-neutral-800 text-neutral-500 cursor-not-allowed"
+                }`}
+              >
+                <Send size={16} />
+                Send
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <p className="text-[11px] text-neutral-500 mt-2 text-center">
+          Tip: Ask for a roadmap in JSON (TOPIC/SUBTOPIC) to get an interactive
+          visualization.
+        </p>
+      </div>
+    </div>
+  );
+}
+
+/* =========================
+   NEW: PracticePanel (2 MCQs + 1 Text, submit together, show solutions, more if <70%)
+========================= */
+function PracticePanel({
+  chatId,
+  topic,
+  subtopic,
+  onAppendMessage,
+  onAppendPerfEvent,
+}: {
+  chatId: string;
+  topic: string;
+  subtopic: string;
+  onAppendMessage: (m: { content: string }) => void;
+  onAppendPerfEvent: (e: {
+    kind: "mcq" | "text";
+    question: string;
+    accuracy: number;
+    details?: any;
+  }) => void;
+}) {
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  // active batch (exactly 2 mcqs + 1 text)
+  const [mcqs, setMcqs] = useState<GeneratedMCQ[]>([]);
+  const [textQ, setTextQ] = useState<GeneratedTextQ | null>(null);
+
+  // user answers
+  const [mcqAnswers, setMcqAnswers] = useState<Array<number | null>>([
+    null,
+    null,
+  ]);
+  const [textAnswer, setTextAnswer] = useState("");
+
+  // review history (previous rounds)
+  type MCQReview = GeneratedMCQ & {
+    pickedIndex: number | null;
+    correct: boolean;
+  };
+  type TextReview = {
+    prompt: string;
+    user: string;
+    score: number;
+    feedback?: string;
+  };
+  const [reviews, setReviews] = useState<
+    Array<{ mcqs: MCQReview[]; text: TextReview; accuracy: number }>
+  >([]);
+
+  const THRESHOLD = 0.7;
+  const fullyAnswered =
+    mcqAnswers.every((v) => typeof v === "number") &&
+    textAnswer.trim().length > 0;
+
+  async function loadBatch() {
+    setLoading(true);
+    setErr(null);
+    try {
+      const res = await generatePractice({
+        topic,
+        subtopic,
+        roadmap: [],
+        numMcqs: 2,
+        numTexts: 1,
+      });
+      setMcqs(res.mcqs.slice(0, 2));
+      setTextQ(
+        res.texts[0] ?? { prompt: `In 3–5 sentences, explain: ${subtopic}` }
+      );
+      setMcqAnswers([null, null]);
+      setTextAnswer("");
+    } catch (e: any) {
+      setErr(e?.message ?? "Failed to generate practice.");
+      setMcqs([]);
+      setTextQ(null);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    loadBatch();
+  }, [topic, subtopic]);
+
+  async function submitAll() {
+    if (!fullyAnswered || !textQ) return;
+
+    // grade MCQs locally
+    const gradedMcqs: MCQReview[] = mcqs.map((q, i) => {
+      const pickedIndex = mcqAnswers[i] as number;
+      const correct = pickedIndex === q.correctIndex;
+      return { ...q, pickedIndex, correct };
+    });
+
+    // simple text grading heuristic (replace with server grader if you have one)
+    let textScore = 0.5;
+    let textFeedback = "Thanks! Keep refining key points and structure.";
+    const len = textAnswer.trim().length;
+    textScore = len > 300 ? 0.9 : len > 120 ? 0.7 : len > 40 ? 0.5 : 0.3;
+    textFeedback =
+      textScore >= 0.7
+        ? "Clear and mostly complete—nice work!"
+        : "Missing depth/examples; try defining terms and giving a worked example.";
+
+    // accuracy across 3 items
+    const mcqScore =
+      (gradedMcqs[0].correct ? 1 : 0) + (gradedMcqs[1].correct ? 1 : 0);
+    const accuracy = (mcqScore + textScore) / 3;
+
+    // persist perf events
+    gradedMcqs.forEach((g) =>
+      onAppendPerfEvent({
+        kind: "mcq",
+        question: g.question,
+        accuracy: g.correct ? 1 : 0,
+        details: { pickedIndex: g.pickedIndex, correctIndex: g.correctIndex },
+      })
+    );
+    onAppendPerfEvent({
+      kind: "text",
+      question: textQ.prompt,
+      accuracy: textScore,
+    });
+
+    // push summary in chat
+    onAppendMessage({
+      content: `Practice recap for “${subtopic}”: ${(accuracy * 100).toFixed(
+        0
+      )}%. ${
+        accuracy < THRESHOLD
+          ? "I’ll give you a few more practice questions."
+          : "Great job — want more practice or move on?"
+      }\n\nWould you like an explanation for any item above?`,
+    });
+
+    // store review (show solutions)
+    setReviews((prev) => [
+      ...prev,
+      {
+        mcqs: gradedMcqs,
+        text: {
+          prompt: textQ.prompt,
+          user: textAnswer,
+          score: textScore,
+          feedback: textFeedback,
+        },
+        accuracy,
+      },
+    ]);
+
+    // load more if needed
+    if (accuracy < THRESHOLD) {
+      await loadBatch();
+    } else {
+      // keep the batch on screen but reset answers so user can decide next
+      setMcqAnswers([null, null]);
+      setTextAnswer("");
+    }
+  }
+
+  return (
+    <div className="space-y-4">
+      {/* Current batch */}
+      <div className="rounded-2xl border border-neutral-800 bg-neutral-900 p-4">
+        <div className="flex items-center justify-between mb-2">
+          <div className="font-semibold text-neutral-100 flex items-center gap-2">
+            <BookOpen size={16} className="text-neutral-400" />
+            Practice: {subtopic}
+          </div>
+          {loading && <div className="text-xs text-neutral-500">loading…</div>}
+        </div>
+
+        {err && (
+          <div className="text-sm text-red-300 bg-red-950/30 border border-red-900/40 rounded p-2 mb-3">
+            {err}
+          </div>
+        )}
+
+        {/* MCQs (2) */}
+        {mcqs.slice(0, 2).map((q, i) => (
+          <div key={`mcq-${i}`} className="mb-4">
+            <div className="text-sm font-medium mb-2">
+              {i + 1}. {q.question}
+            </div>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+              {q.options.map((opt, j) => {
+                const selected = mcqAnswers[i] === j;
+                return (
+                  <button
+                    key={j}
+                    onClick={() =>
+                      setMcqAnswers((prev) => {
+                        const copy = [...prev];
+                        copy[i] = j;
+                        return copy;
+                      })
+                    }
+                    className={`text-left text-sm rounded-lg border px-3 py-2 ${
+                      selected
+                        ? "border-amber-500 bg-amber-500/10 text-amber-200"
+                        : "border-neutral-800 bg-neutral-800/40 hover:bg-neutral-800 text-neutral-200"
+                    }`}
+                  >
+                    {opt}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        ))}
+
+        {/* Text (1) */}
+        {textQ && (
+          <div className="mb-4">
+            <div className="text-sm font-medium mb-2">3. {textQ.prompt}</div>
+            <textarea
+              rows={5}
+              value={textAnswer}
+              onChange={(e) => setTextAnswer(e.target.value)}
+              className="w-full rounded-lg border border-neutral-800 bg-neutral-900 focus:ring-1 focus:ring-amber-500/50 px-3 py-2 text-sm"
+              placeholder="Write your answer here…"
+            />
+            {textQ.context && (
+              <div className="mt-2 text-xs text-neutral-500">
+                Hint: {textQ.context}
+              </div>
+            )}
+          </div>
+        )}
+
+        <div className="flex items-center justify-end gap-2">
+          <button
+            onClick={submitAll}
+            disabled={!fullyAnswered || loading}
             className={`inline-flex items-center gap-2 rounded-lg px-3 py-2 text-sm font-medium ${
-              !disabled
-                ? "bg-orange-500 text-white hover:bg-orange-600"
+              fullyAnswered && !loading
+                ? "bg-gradient-to-b from-amber-500 to-amber-600 text-black hover:brightness-105"
                 : "bg-neutral-800 text-neutral-500 cursor-not-allowed"
             }`}
           >
-            <Send size={16} />
-            Send
+            Submit practice (2 MCQ + 1 Text)
           </button>
         </div>
       </div>
-      <p className="text-[11px] text-neutral-500 mt-2 text-center">
-        Ask for learning roadmaps and I’ll create interactive visualizations for
-        you
-      </p>
+
+      {/* Reviews (solutions) */}
+      {reviews.length > 0 && (
+        <div className="space-y-4">
+          {reviews
+            .slice()
+            .reverse()
+            .map((r, idx) => (
+              <div
+                key={`rev-${reviews.length - 1 - idx}`}
+                className="rounded-2xl border border-neutral-800 bg-neutral-900 p-4"
+              >
+                <div className="flex items-center justify-between mb-2">
+                  <div className="text-sm font-semibold">
+                    Previous round • Accuracy: {(r.accuracy * 100).toFixed(0)}%
+                  </div>
+                </div>
+
+                {/* MCQ review */}
+                {r.mcqs.map((q, i) => (
+                  <div key={`rev-mcq-${i}`} className="mb-3">
+                    <div className="text-sm font-medium mb-1">
+                      {i + 1}. {q.question}
+                    </div>
+                    <div className="text-xs mb-1">
+                      Your answer:{" "}
+                      <span
+                        className={
+                          q.correct ? "text-emerald-300" : "text-red-300"
+                        }
+                      >
+                        {typeof q.pickedIndex === "number"
+                          ? q.options[q.pickedIndex]
+                          : "—"}
+                      </span>
+                      {"  "}• Correct:{" "}
+                      <span className="text-amber-300">
+                        {q.options[q.correctIndex]}
+                      </span>
+                    </div>
+                    {q.explanation && (
+                      <div className="text-xs text-neutral-400">
+                        Why: {q.explanation}
+                      </div>
+                    )}
+                  </div>
+                ))}
+
+                {/* Text review */}
+                <div className="mt-2">
+                  <div className="text-sm font-medium mb-1">Text question</div>
+                  <div className="text-xs text-neutral-500 mb-1">
+                    Score: {(r.text.score * 100).toFixed(0)}%
+                  </div>
+                  <div className="text-sm whitespace-pre-wrap rounded border border-neutral-800 bg-neutral-950 px-3 py-2">
+                    {r.text.user || "—"}
+                  </div>
+                  {r.text.feedback && (
+                    <div className="text-xs text-neutral-400 mt-2">
+                      Feedback: {r.text.feedback}
+                    </div>
+                  )}
+                </div>
+              </div>
+            ))}
+        </div>
+      )}
     </div>
   );
 }
@@ -628,28 +1156,84 @@ export default function ChatByIdPage() {
 
   const [currentMessage, setCurrentMessage] = useState("");
   const [isTyping, setIsTyping] = useState(false);
-  const [messages, setMessages] = useState<ChatMessage[]>([
-    {
-      id: crypto.randomUUID(),
-      type: "ai",
-      content:
-        "Hi! I'm your learning copilot. Ask anything.\nTip: Ask for a roadmap in JSON (TOPIC/SUBTOPIC) and I'll render it as an interactive graph.",
-      timestamp: Date.now(),
-    } as TextMessage,
-  ]);
-
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [meta, setMeta] = useState<Meta>({
+    history: [],
+    performance: [],
+    sources: [],
+  });
   const [selectedLearningTopic, setSelectedLearningTopic] = useState<{
     topicName: string;
     subtopicName: string;
   } | null>(null);
 
-  // Dynamic practice state (Gemini)
-  const [practiceLoading, setPracticeLoading] = useState(false);
-  const [practiceErr, setPracticeErr] = useState<string | null>(null);
-  const [genMcqs, setGenMcqs] = useState<GeneratedMCQ[]>([]);
-  const [genTexts, setGenTexts] = useState<GeneratedTextQ[]>([]);
+  // attachments for the composer (PDFs)
+  const [attachments, setAttachments] = useState<File[]>([]);
 
-  // --- helpers for HTTP ---
+  // Hydrate from server
+  useEffect(() => {
+    let canceled = false;
+    (async () => {
+      if (!chatId) return;
+
+      try {
+        const snap = await getChatSnapshot(chatId);
+        if (!snap?.ok || canceled) return;
+
+        const textMsgs: TextMessage[] = (snap.chat.messages ?? []) as any;
+        const msgs: ChatMessage[] = [...textMsgs];
+        const plan = (snap.chat as any).roadmap as Roadmap | null;
+
+        if (plan && Array.isArray(plan) && plan.length) {
+          msgs.push({
+            id: crypto.randomUUID(),
+            type: "roadmap",
+            plan,
+            note: roadmapLeadIn(plan),
+            timestamp: Date.now(),
+          } as RoadmapMessage);
+        }
+
+        setMessages(
+          msgs.length
+            ? msgs
+            : [
+                {
+                  id: crypto.randomUUID(),
+                  type: "ai",
+                  content:
+                    "Hi! I’m your learning copilot. Ask anything.\nTry: “Create a learning roadmap for Machine Learning (TOPIC/SUBTOPIC JSON)”",
+                  timestamp: Date.now(),
+                } as TextMessage,
+              ]
+        );
+
+        const hist = ((snap.chat as any).history ?? []) as Meta["history"];
+        const perf = ((snap.chat as any).performance ??
+          []) as Meta["performance"];
+        const sources = ((snap.chat as any).sources ?? []) as Meta["sources"];
+        setMeta({
+          history: Array.isArray(hist) ? hist : [],
+          performance: Array.isArray(perf) ? perf : [],
+          sources: Array.isArray(sources) ? sources : [],
+        });
+      } catch {
+        setMessages([
+          {
+            id: crypto.randomUUID(),
+            type: "ai",
+            content:
+              "Hi! I’m your learning copilot. Ask anything.\nTry: “Create a learning roadmap for Machine Learning (TOPIC/SUBTOPIC JSON)”",
+            timestamp: Date.now(),
+          } as TextMessage,
+        ]);
+      }
+    })();
+    return () => {
+      canceled = true;
+    };
+  }, [chatId]);
+
   async function getAskRaw(query: string): Promise<string> {
     const res = await fetch(ROADMAP_GET(query), {
       method: "GET",
@@ -698,30 +1282,189 @@ export default function ChatByIdPage() {
     }
   }
 
-  // --- send handler (unchanged routing) ---
+  // helper: add/remove attachments
+  function addAttachment(file: File) {
+    setAttachments((prev) => {
+      const exists = prev.some(
+        (f) => f.name === file.name && f.size === file.size
+      );
+      return exists ? prev : [...prev, file];
+    });
+  }
+  function removeAttachment(index: number) {
+    setAttachments((prev) => prev.filter((_, i) => i !== index));
+  }
+
+  // --- send handler ---
   async function handleSend(text: string) {
     if (!chatId) return;
+    const question = text.trim(); // may be empty if only PDFs attached
     setCurrentMessage("");
 
+    // If we have attachments, run PDF flow for each using the textarea prompt, then clear attachments.
+    if (attachments.length > 0) {
+      const localFiles = [...attachments];
+      setAttachments([]); // clear UI
+
+      for (const file of localFiles) {
+        const userMsg: TextMessage = {
+          id: crypto.randomUUID(),
+          type: "user",
+          content: `📄 Attached PDF: ${file.name}\n\nPrompt: ${
+            question || "(no prompt entered)"
+          }`,
+          timestamp: Date.now(),
+        };
+        setMessages((prev) => [...prev, userMsg]);
+
+        setIsTyping(true);
+        try {
+          const res = await askPdfQuery(
+            file,
+            question || `Summarize key ideas from "${file.name}"`
+          );
+
+          // helper: roadmap check
+          const looksLikeRoadmap = (val: any): val is Roadmap =>
+            Array.isArray(val) &&
+            val.every(
+              (t) =>
+                t &&
+                t.type === "TOPIC" &&
+                typeof t.name === "string" &&
+                Array.isArray(t.subtopics) &&
+                t.subtopics.every(
+                  (s: any) =>
+                    s && s.type === "SUBTOPIC" && typeof s.name === "string"
+                )
+            );
+
+          const patch = res.metadata_patch as SourceDoc | undefined;
+          const nextMeta: Meta = {
+            ...meta,
+            history: [
+              ...meta.history,
+              {
+                ts: Date.now(),
+                user: `PDF: ${file.name} • ${question || "(no prompt)"}`,
+                ai: "PDF processed.",
+              },
+            ],
+            sources: patch
+              ? [...(meta.sources || []), patch]
+              : meta.sources || [],
+          };
+          setMeta(nextMeta);
+
+          if (looksLikeRoadmap(res.answer)) {
+            const plan = res.answer;
+
+            const lead: TextMessage = {
+              id: crypto.randomUUID(),
+              type: "ai",
+              content:
+                roadmapLeadIn(plan) +
+                (res.source ? `\n\nSource: ${res.source}` : ""),
+              timestamp: Date.now(),
+            };
+
+            const road: RoadmapMessage = {
+              id: crypto.randomUUID(),
+              type: "roadmap",
+              plan,
+              note: undefined,
+              timestamp: Date.now(),
+            };
+
+            setMessages((prev) => [...prev, lead, road]);
+
+            await savePlanAsPathway({
+              plan,
+              title: `Learning Path from ${file.name}`,
+              chatId,
+              status: "ACTIVE",
+            });
+
+            await saveChatSnapshot({
+              chatId,
+              messages: [...messages, userMsg, lead].filter(
+                (m): m is TextMessage => m.type === "user" || m.type === "ai"
+              ),
+              roadmap: plan,
+              titleFallback: `PDF: ${file.name}`,
+              meta: nextMeta as any,
+            });
+          } else {
+            const aiMsg: TextMessage = {
+              id: crypto.randomUUID(),
+              type: "ai",
+              content:
+                (typeof res.answer === "string"
+                  ? res.answer
+                  : JSON.stringify(res.answer)) +
+                (res.source ? `\n\nSource: ${res.source}` : ""),
+              timestamp: Date.now(),
+            };
+
+            setMessages((prev) => [...prev, aiMsg]);
+
+            await saveChatSnapshot({
+              chatId,
+              messages: [...messages, userMsg, aiMsg].filter(
+                (m): m is TextMessage => m.type === "user" || m.type === "ai"
+              ),
+              roadmap: null,
+              titleFallback: `PDF: ${file.name}`,
+              meta: nextMeta as any,
+            });
+          }
+        } catch (err: any) {
+          const aiErr: TextMessage = {
+            id: crypto.randomUUID(),
+            type: "ai",
+            content: `Could not process PDF "${file.name}":\n\n${
+              err?.message ?? "Unknown error"
+            }`,
+            timestamp: Date.now(),
+          };
+          setMessages((prev) => [...prev, aiErr]);
+        } finally {
+          setIsTyping(false);
+        }
+      }
+
+      return; // stop here (PDF flow handled). If user also had text, it was used as the prompt.
+    }
+
+    // If no attachments and no text, do nothing
+    if (!question) return;
+
+    // ------- NORMAL (non-PDF) FLOW -------
     const userMsg: TextMessage = {
       id: crypto.randomUUID(),
       type: "user",
-      content: text,
+      content: question,
       timestamp: Date.now(),
     };
+
+    const newMeta: Meta = {
+      ...meta,
+      history: [...meta.history, { ts: Date.now(), user: question }],
+    };
+    setMeta(newMeta);
 
     let afterUser: ChatMessage[] = [];
     setMessages((prev) => (afterUser = [...prev, userMsg]));
 
     setIsTyping(true);
     try {
-      const verdict = await classifyPrompt(text);
+      const verdict = await classifyPrompt(question);
 
       let finalArray: ChatMessage[] = afterUser;
       let latestPlan: Roadmap | null = null;
 
       if (verdict.type === "roadmap") {
-        const raw = await getAskRaw(text);
+        const raw = await getAskRaw(question);
         const plan = tryExtractRoadmapFromText(raw);
 
         if (!plan) {
@@ -732,6 +1475,25 @@ export default function ChatByIdPage() {
             timestamp: Date.now(),
           };
           setMessages((prev) => (finalArray = [...prev, fallbackAI]));
+
+          const withAi: Meta = {
+            ...newMeta,
+            history: [
+              ...newMeta.history,
+              { ts: Date.now(), user: question, ai: raw },
+            ],
+          };
+          setMeta(withAi);
+
+          await saveChatSnapshot({
+            chatId,
+            messages: finalArray.filter(
+              (m): m is TextMessage => m.type === "user" || m.type === "ai"
+            ),
+            roadmap: null,
+            titleFallback: afterUser.length <= 2 ? question.slice(0, 60) : null,
+            meta: withAi as any,
+          });
         } else {
           latestPlan = plan;
 
@@ -749,18 +1511,38 @@ export default function ChatByIdPage() {
           };
           setMessages((prev) => (finalArray = [...prev, lead, road]));
 
+          const withAi: Meta = {
+            ...newMeta,
+            history: [
+              ...newMeta.history,
+              { ts: Date.now(), user: question, ai: lead.content },
+            ],
+          };
+          setMeta(withAi);
+
           await savePlanAsPathway({
             plan,
             title: "Learning Path",
             chatId,
             status: "ACTIVE",
           });
+
+          await saveChatSnapshot({
+            chatId,
+            messages: finalArray.filter(
+              (m): m is TextMessage => m.type === "user" || m.type === "ai"
+            ),
+            roadmap: latestPlan,
+            titleFallback: afterUser.length <= 2 ? question.slice(0, 60) : null,
+            meta: withAi as any,
+          });
         }
       } else {
-        const metadata = buildMetadata(afterUser, null);
+        const payloadMeta = newMeta;
+        const metadata = buildPayloadMetadata(afterUser, null, payloadMeta);
         const result = await postJSON<any>(CHAT_POST, {
           metadata,
-          query: text,
+          query: question,
         });
 
         const raw =
@@ -777,6 +1559,15 @@ export default function ChatByIdPage() {
           timestamp: Date.now(),
         };
         setMessages((prev) => (finalArray = [...prev, aiText]));
+
+        const withAi: Meta = {
+          ...payloadMeta,
+          history: [
+            ...payloadMeta.history,
+            { ts: Date.now(), user: question, ai: aiText.content },
+          ],
+        };
+        setMeta(withAi);
 
         if (possiblePlan) {
           latestPlan = possiblePlan;
@@ -795,71 +1586,59 @@ export default function ChatByIdPage() {
             status: "ACTIVE",
           });
         }
-      }
 
-      await saveChatSnapshot({
-        chatId,
-        messages: finalArray.filter(
-          (m): m is TextMessage => m.type === "user" || m.type === "ai"
-        ),
-        roadmap: latestPlan ?? null,
-        titleFallback: afterUser.length <= 2 ? text.slice(0, 60) : null,
-      });
+        await saveChatSnapshot({
+          chatId,
+          messages: finalArray.filter(
+            (m): m is TextMessage => m.type === "user" || m.type === "ai"
+          ),
+          roadmap: latestPlan ?? null,
+          titleFallback: afterUser.length <= 2 ? question.slice(0, 60) : null,
+          meta: withAi as any,
+        });
+
+        // After every normal answer, ask if they want practice
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: crypto.randomUUID(),
+            type: "ai",
+            content:
+              "Would you like me to quiz you on this? I can give you 2 MCQs + 1 short question and adapt if needed.",
+            timestamp: Date.now(),
+          } as TextMessage,
+        ]);
+      }
     } catch (e: any) {
+      const msg = e?.message ?? "Unknown error";
       const aiErr: TextMessage = {
         id: crypto.randomUUID(),
         type: "ai",
-        content: `Could not reach server:\n\n${e?.message ?? "Unknown error"}`,
+        content: `Could not reach server:\n\n${msg}`,
         timestamp: Date.now(),
       };
       setMessages((prev) => [...prev, aiErr]);
+
+      const withErr: Meta = {
+        ...meta,
+        history: [
+          ...meta.history,
+          { ts: Date.now(), user: question, ai: aiErr.content },
+        ],
+      };
+      setMeta(withErr);
+
       await saveChatSnapshot({
         chatId,
-        messages: [...messages, userMsg, aiErr].filter(
+        messages: [...messages, aiErr].filter(
           (m): m is TextMessage => m.type === "user" || m.type === "ai"
         ),
+        meta: withErr as any,
       });
     } finally {
       setIsTyping(false);
     }
   }
-
-  // Generate practice whenever a subtopic is selected (and we have a roadmap)
-  useEffect(() => {
-    let alive = true;
-    (async () => {
-      if (!selectedLearningTopic) return;
-      // find the latest roadmap in the chat to pass as context
-      const latestRoadmap = [...messages]
-        .reverse()
-        .find((m): m is RoadmapMessage => m.type === "roadmap")?.plan;
-
-      setPracticeLoading(true);
-      setPracticeErr(null);
-      setGenMcqs([]);
-      setGenTexts([]);
-      try {
-        const res = await generatePractice({
-          topic: selectedLearningTopic.topicName,
-          subtopic: selectedLearningTopic.subtopicName,
-          roadmap: latestRoadmap ?? [],
-          numMcqs: 3,
-          numTexts: 2,
-        });
-        if (!alive) return;
-        setGenMcqs(res.mcqs || []);
-        setGenTexts(res.texts || []);
-      } catch (e: any) {
-        if (!alive) return;
-        setPracticeErr(e?.message ?? "Failed to generate practice.");
-      } finally {
-        if (alive) setPracticeLoading(false);
-      }
-    })();
-    return () => {
-      alive = false;
-    };
-  }, [selectedLearningTopic, messages]);
 
   function handleSubtopicClick(topicName: string, subtopicName: string) {
     setSelectedLearningTopic({ topicName, subtopicName });
@@ -871,41 +1650,78 @@ export default function ChatByIdPage() {
   const isLearningMode = selectedLearningTopic !== null;
 
   return (
-    <div className="min-h-screen bg-neutral-950 text-neutral-100 flex flex-col">
+    <div className="min-h-screen bg-[#0b0b0c] text-neutral-100 flex flex-col relative">
+      {/* Soft background accents */}
+      <div className="pointer-events-none absolute inset-0">
+        <div className="absolute left-[20%] top-10 h-72 w-72 rounded-full blur-3xl opacity-20 bg-amber-500" />
+        <div className="absolute right-[18%] bottom-10 h-72 w-72 rounded-full blur-3xl opacity-10 bg-fuchsia-600" />
+        <div className="absolute inset-0 opacity-[0.04] [background-image:radial-gradient(#fff_1px,transparent_1px)] [background-size:18px_18px]" />
+      </div>
+
       <Header />
 
       <div className="flex-1 flex overflow-hidden">
         {/* Left: Chat */}
         <div
           className={`${
-            isLearningMode ? "w-1/2" : "w-full"
+            isLearningMode ? "w-full lg:w-1/2" : "w-full"
           } flex flex-col transition-all duration-300`}
         >
           <main
-            className={`flex-1 overflow-y-auto ${
+            className={`flex-1 overflow-y-auto px-4 py-6 ${
               isLearningMode ? "max-w-none" : "mx-auto max-w-3xl"
-            } px-4 py-6 space-y-6`}
+            }`}
           >
-            <ChatMessages
-              messages={messages}
-              isTyping={isTyping}
-              onSubtopicClick={handleSubtopicClick}
-            />
+            {/* Empty-state hero */}
+            {messages.length <= 1 && (
+              <div className="mx-auto max-w-3xl mb-6">
+                <div className="rounded-2xl border border-neutral-800 bg-neutral-950/60 shadow-[0_0_0_1px_rgba(255,255,255,0.02)] backdrop-blur p-6 md:p-7 space-y-2 text-center">
+                  <div className="inline-flex items-center gap-2 rounded-full border border-neutral-800 bg-neutral-900/60 px-3 py-1 text-[11px] text-neutral-400">
+                    <Sparkles size={14} /> Intelligent assistance, minimal noise
+                  </div>
+                  <h1 className="text-2xl md:text-3xl font-semibold tracking-tight">
+                    Start learning today
+                  </h1>
+                  <p className="text-sm text-neutral-400">
+                    Ask for a roadmap or upload a PDF to get tailored practice.
+                  </p>
+                </div>
+              </div>
+            )}
+
+            <div className="mx-auto max-w-3xl">
+              <ChatMessages
+                messages={messages}
+                isTyping={isTyping}
+                onSubtopicClick={handleSubtopicClick}
+              />
+            </div>
           </main>
 
           <ChatInput
             currentMessage={currentMessage}
             setCurrentMessage={setCurrentMessage}
             onSend={handleSend}
-            disabled={!currentMessage.trim() || !chatId}
+            onPickPdf={addAttachment}
+            attachments={attachments}
+            onRemoveAttachment={removeAttachment}
+            disabled={
+              !chatId || (!currentMessage.trim() && attachments.length === 0)
+            }
+            showPracticeToggle={!!selectedLearningTopic}
+            practiceOpen={!!selectedLearningTopic}
+            onTogglePractice={() =>
+              selectedLearningTopic ? closeLearningContent() : null
+            }
           />
         </div>
 
-        {/* Right: Practice Panel WITH /content + Gemini-generated practice */}
+        {/* Right: Practice Panel */}
         {isLearningMode && selectedLearningTopic && (
-          <div className="w-1/2 h-full overflow-y-auto border-l border-neutral-800 p-4 space-y-4">
+          <div className="hidden lg:block w-1/2 h-full overflow-y-auto border-l border-neutral-900/70 p-4 space-y-4 bg-[#0b0b0c]/60 backdrop-blur">
             <div className="flex items-center justify-between">
-              <h3 className="font-semibold text-neutral-200">
+              <h3 className="font-semibold text-neutral-200 flex items-center gap-2">
+                <BookOpen size={16} className="text-neutral-400" />
                 {selectedLearningTopic.subtopicName}
               </h3>
               <button
@@ -916,66 +1732,54 @@ export default function ChatByIdPage() {
               </button>
             </div>
 
-            {/* Study content pulled from /content API (above practice) */}
+            {/* Study content (API) */}
             <LearningContent query={selectedLearningTopic.subtopicName} />
 
-            {/* Gemini-generated practice */}
-            {practiceLoading && (
-              <div className="rounded-xl border border-neutral-800 bg-neutral-900 p-4 text-sm text-neutral-300">
-                Generating practice…
-              </div>
-            )}
-            {practiceErr && (
-              <div className="rounded-xl border border-red-900/40 bg-red-950/40 p-4 text-sm text-red-300">
-                {practiceErr}
-              </div>
-            )}
-
-            {/* MCQs */}
-            {(genMcqs.length
-              ? genMcqs
-              : [
-                  // Fallback MCQ if Gemini returns nothing
+            {/* NEW practice flow */}
+            <PracticePanel
+              chatId={chatId!}
+              topic={selectedLearningTopic.topicName}
+              subtopic={selectedLearningTopic.subtopicName}
+              onAppendMessage={(m) =>
+                setMessages((prev) => [
+                  ...prev,
                   {
-                    question: `Which statement about ${selectedLearningTopic.subtopicName} is true?`,
-                    options: [
-                      "It is unrelated to React rendering.",
-                      `It helps organize ${selectedLearningTopic.subtopicName} for maintainability.`,
-                      "It always slows down performance.",
-                      "It cannot be used with TypeScript.",
-                    ],
-                    correctIndex: 1,
+                    id: crypto.randomUUID(),
+                    type: "ai",
+                    content: m.content,
+                    timestamp: Date.now(),
                   },
-                ]
-            ).map((q, idx) => (
-              <MCQCard
-                key={`mcq-${idx}`}
-                question={q.question}
-                options={q.options}
-                correctIndex={q.correctIndex}
-                explanation={q.explanation}
-              />
-            ))}
+                ])
+              }
+              onAppendPerfEvent={async (ev) => {
+                setMeta((prev) => ({
+                  ...prev,
+                  performance: [
+                    ...prev.performance,
+                    {
+                      ts: Date.now(),
+                      kind: ev.kind,
+                      question: ev.question,
+                      accuracy: ev.accuracy,
+                    },
+                  ],
+                }));
+                if (chatId) {
+                  await appendPerformanceEvent({
+                    chatId,
+                    event: {
+                      ts: Date.now(),
+                      kind: ev.kind,
+                      question: ev.question,
+                      accuracy: ev.accuracy,
+                      details: ev.details,
+                    },
+                  });
+                }
+              }}
+            />
 
-            {/* Short-answer prompts */}
-            {(genTexts.length
-              ? genTexts
-              : [
-                  // Fallback text prompt
-                  {
-                    prompt: `In 3–5 sentences, explain how you would apply ${selectedLearningTopic.subtopicName} within ${selectedLearningTopic.topicName} and mention one common pitfall to avoid.`,
-                    context: `Topic: ${selectedLearningTopic.topicName}. Subtopic: ${selectedLearningTopic.subtopicName}. Audience: beginner.`,
-                  },
-                ]
-            ).map((t, idx) => (
-              <TextAnswerCard
-                key={`textq-${idx}`}
-                prompt={t.prompt}
-                context={t.context}
-              />
-            ))}
-
-            {/* Optional: YouTube */}
+            {/* YouTube */}
             <YoutubeRecs topic={selectedLearningTopic.subtopicName} />
           </div>
         )}

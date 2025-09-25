@@ -4,44 +4,48 @@
 import { getServerSession } from "next-auth";
 import { prisma } from "@/lib/prisma";
 
+/* ============================================================
+   Types
+============================================================ */
+export type ChatMessage = {
+  id: string;
+  type: "user" | "ai";
+  content: string;
+  timestamp: number;
+};
+
+type PerfEntry = {
+  ts: number;
+  kind: "mcq" | "text";
+  question: string;
+  accuracy: number; // 0..1
+};
+
+type HistoryEntry = {
+  ts: number;
+  user: string;
+  ai?: string;
+};
+
+type ChatMeta = {
+  messages?: ChatMessage[];
+  roadmap?: unknown;
+  ui?: Record<string, unknown>;
+  events?: Array<{ type: string; ts: number; data?: any }>;
+  history?: HistoryEntry[];
+  performance?: PerfEntry[];
+};
+
+type RoadmapSubtopic = { type: "SUBTOPIC"; name: string };
+type RoadmapTopic = { type: "TOPIC"; name: string; subtopics: RoadmapSubtopic[] };
+type Roadmap = RoadmapTopic[];
+
+/* ============================================================
+   Internal helpers
+============================================================ */
+
 /**
- * Resolve a DB user id from NextAuth session, preferring email.
- * If there's no email, we fall back to `name`: find or create a user with that name.
- * (Still stores the *id* into Chat.userId, to match your schema.)
- */
-async function resolveUserIdFromSession(): Promise<string> {
-  const session = await getServerSession(); // If your app needs options, pass them here.
-  const email = session?.user?.email?.trim() || null;
-  const name  = session?.user?.name?.trim() || null;
-console.log("Session user:", { email, name });  
-  // 1) Prefer email (unique, stable)
-  if (email) {
-    const user = await prisma.user.findFirst({
-      where: { email },
-      select: { id: true },
-    });
-    return user.id;
-  }
-
-  // 2) Fallback to name (not guaranteed unique -> findFirst or create)
-  if (name) {
-    const existing = await prisma.user.findFirst({
-      where: { name },
-      select: { id: true },
-      orderBy: { createdAt: "desc" }, // choose most recent if multiple
-    });
-    if (existing) return existing.id;
-
-
-    return created.id;
-  }
-
-  // 3) Final fallback: guest
-  return ensureGuestUserId();
-}
-
-/**
- * Create a persistent guest user and return its id.
+ * Ensure we have a stable "guest" user row and return its id.
  */
 async function ensureGuestUserId(): Promise<string> {
   const g = await prisma.user.upsert({
@@ -54,71 +58,57 @@ async function ensureGuestUserId(): Promise<string> {
 }
 
 /**
- * Create a chat for the current user (resolved from session by name/email).
- * Optionally seed meta with the initial snapshot of messages/roadmap.
+ * Resolve a DB user id from NextAuth session.
+ * - Prefer email: upsert by email (stable).
+ * - Fallback to name: find latest by name or create a name-only user.
+ * - Final fallback: persistent "Guest".
  */
+async function resolveUserIdFromSession(): Promise<string> {
+  const session = await getServerSession();
+  const email = session?.user?.email?.trim() || null;
+  const name = session?.user?.name?.trim() || null;
+
+  // 1) Prefer email: upsert for stability
+  if (email) {
+    const user = await prisma.user.upsert({
+      where: { email },
+      update: {},
+      create: { email, name: name ?? email.split("@")[0] },
+      select: { id: true },
+    });
+    return user.id;
+  }
+
+  // 2) Fallback to name (not unique): find latest or create
+  if (name) {
+    const existing = await prisma.user.findFirst({
+      where: { name },
+      select: { id: true },
+      orderBy: { createdAt: "desc" },
+    });
+    if (existing) return existing.id;
+
+    const created = await prisma.user.create({
+      data: { name },
+      select: { id: true },
+    });
+    return created.id;
+  }
+
+  // 3) Guest
+  return ensureGuestUserId();
+}
 
 /**
- * Overwrite (or create) a compact transcript snapshot in Chat.meta.
- * You can call this after each turn to persist messages & roadmap.
+ * Current user id (always resolves; no throwing).
  */
-export async function saveChatSnapshot(params: {
-  chatId: string;
-  messages: Array<{ id: string; type: "user" | "ai"; content: string; timestamp: number }>;
-  roadmap?: unknown;
-  titleFallback?: string | null;
-}) {
-  const userId = await resolveUserIdFromSession();
-
-  // Ownership check
-  const chat = await prisma.chat.findUnique({
-    where: { id: params.chatId },
-    select: { userId: true, title: true },
-  });
-  if (!chat || chat.userId !== userId) {
-    return { ok: false as const, error: "Chat not found or not owned by user." };
-  }
-
-  // Optional title backfill once
-  const updateData: any = {
-    meta: {
-      messages: params.messages,
-      roadmap: params.roadmap ?? null,
-    },
-  };
-  if (params.titleFallback && !chat.title) {
-    updateData.title = params.titleFallback;
-  }
-
-  await prisma.chat.update({
-    where: { id: params.chatId },
-    data: updateData,
-  });
-
-  return { ok: true as const };
-}
-
-export type ChatMessage = {
-  id: string;
-  type: "user" | "ai";
-  content: string;
-  timestamp: number;
-};
-
-type ChatMeta = {
-  messages?: ChatMessage[];
-  roadmap?: unknown;
-  ui?: Record<string, unknown>;
-  events?: Array<{ type: string; ts: number; data?: any }>;
-};
-
-/* ------------------ helpers ------------------ */
 async function whoami(): Promise<string> {
-  const session = await getServerSession();
-  return session?.user?.name ? await resolveUserIdFromSession() : ensureGuestUserId();
+  return resolveUserIdFromSession();
 }
 
-
+/**
+ * Ownership guard.
+ */
 async function assertOwnChat(chatId: string, userId: string) {
   const chat = await prisma.chat.findUnique({
     where: { id: chatId },
@@ -129,25 +119,52 @@ async function assertOwnChat(chatId: string, userId: string) {
   }
 }
 
-/* ------------------ create / list ------------------ */
+/**
+ * Non-destructive meta merge. Concats arrays where appropriate.
+ */
+function mergeMeta(current: ChatMeta | null | undefined, incoming: Partial<ChatMeta>): ChatMeta {
+  const a = current ?? {};
+  const b = incoming ?? {};
+
+  return {
+    // primitives / objects
+    ui: { ...(a.ui ?? {}), ...(b.ui ?? {}) },
+    roadmap: b.roadmap !== undefined ? b.roadmap : a.roadmap,
+    // arrays (concat)
+    messages: [...(a.messages ?? []), ...(b.messages ?? [])],
+    events: [...(a.events ?? []), ...(b.events ?? [])],
+    history: [...(a.history ?? []), ...(b.history ?? [])],
+    performance: [...(a.performance ?? []), ...(b.performance ?? [])],
+  };
+}
+
+/* ============================================================
+   Create / List
+============================================================ */
 export async function createChat(params: {
   title?: string | null;
   userSubjectId?: string | null;
   initialMessages?: ChatMessage[];
   initialRoadmap?: unknown;
+  initialMeta?: Partial<ChatMeta>;
 }) {
   const userId = await whoami();
+
+  const baseMeta: ChatMeta = {
+    messages: params.initialMessages ?? [],
+    roadmap: params.initialRoadmap ?? null,
+    events: [{ type: "createChat", ts: Date.now() }],
+    history: [],
+    performance: [],
+    ...(params.initialMeta ?? {}),
+  };
 
   const chat = await prisma.chat.create({
     data: {
       userId,
       title: params.title ?? null,
       userSubjectId: params.userSubjectId ?? null,
-      meta: {
-        messages: params.initialMessages ?? [],
-        roadmap: params.initialRoadmap ?? null,
-        events: [{ type: "createChat", ts: Date.now() }],
-      } as ChatMeta,
+      meta: baseMeta as any,
     },
     select: { id: true, title: true },
   });
@@ -165,7 +182,59 @@ export async function listChats() {
   return { ok: true as const, items };
 }
 
-/* ------------------ load / save turn ------------------ */
+/* ============================================================
+   Load / Save snapshots & turns
+============================================================ */
+
+/**
+ * Overwrite/merge a compact transcript snapshot in Chat.meta.
+ * - Replaces messages/roadmap with the provided ones.
+ * - Merges incoming meta.history/performance/ui/events with existing (non-destructive).
+ */
+export async function saveChatSnapshot(params: {
+  chatId: string;
+  messages: Array<{ id: string; type: "user" | "ai"; content: string; timestamp: number }>;
+  roadmap?: unknown;
+  titleFallback?: string | null;
+  meta?: Partial<ChatMeta>; // <--- NEW: allow sending history/performance/ui/events patches
+}) {
+  const userId = await whoami();
+
+  const chat = await prisma.chat.findUnique({
+    where: { id: params.chatId },
+    select: { userId: true, title: true, meta: true },
+  });
+  if (!chat || chat.userId !== userId) {
+    return { ok: false as const, error: "Chat not found or not owned by user." };
+  }
+
+  const existingMeta = (chat.meta ?? {}) as ChatMeta;
+
+  // Build the next meta:
+  // - Force-set messages & roadmap to provided snapshot
+  // - Merge other fields from incoming meta (history/performance/ui/events)
+  const nextMeta = mergeMeta(
+    { ...existingMeta, messages: [], roadmap: null }, // start from existing but clear arrays we will overwrite
+    {
+      messages: params.messages,
+      roadmap: params.roadmap ?? null,
+      ...(params.meta ?? {}),
+    }
+  );
+
+  const updateData: any = { meta: nextMeta };
+  if (params.titleFallback && !chat.title) {
+    updateData.title = params.titleFallback;
+  }
+
+  await prisma.chat.update({
+    where: { id: params.chatId },
+    data: updateData,
+  });
+
+  return { ok: true as const };
+}
+
 export async function getChatSnapshot(chatId: string) {
   const userId = await whoami();
   await assertOwnChat(chatId, userId);
@@ -184,6 +253,8 @@ export async function getChatSnapshot(chatId: string) {
       title: chat!.title ?? null,
       messages: meta.messages ?? [],
       roadmap: meta.roadmap ?? null,
+      history: meta.history ?? [],
+      performance: meta.performance ?? [],
       updatedAt: chat!.updatedAt,
       startedAt: chat!.startedAt,
     },
@@ -196,6 +267,7 @@ export async function appendTurn(params: {
   aiMsg: ChatMessage;
   roadmap?: unknown | null;
   uiPatch?: Record<string, unknown>;
+  metaPatch?: Partial<Pick<ChatMeta, "history" | "performance" | "events">>; // NEW optional patches
 }) {
   const userId = await whoami();
   await assertOwnChat(params.chatId, userId);
@@ -209,7 +281,7 @@ export async function appendTurn(params: {
     const meta = (current?.meta ?? {}) as ChatMeta;
     const messages = [...(meta.messages ?? []), params.userMsg, params.aiMsg];
 
-    const nextMeta: ChatMeta = {
+    const baseNext: ChatMeta = {
       ...meta,
       messages,
       ...(params.roadmap !== undefined ? { roadmap: params.roadmap } : {}),
@@ -219,6 +291,8 @@ export async function appendTurn(params: {
         { type: "appendTurn", ts: Date.now(), data: { len: params.userMsg.content.length } },
       ],
     };
+
+    const nextMeta = mergeMeta(baseNext, params.metaPatch ?? {});
 
     const maybeTitle =
       !current?.title && messages.length
@@ -234,7 +308,37 @@ export async function appendTurn(params: {
   return { ok: true as const };
 }
 
-/* ------------------ optional utilities ------------------ */
+/**
+ * Append one (or many) performance entries atomically.
+ * Call this from grading flows if you want server-side canonical tracking,
+ * in addition to the client meta you already push.
+ */
+export async function recordPerformance(params: {
+  chatId: string;
+  entries: PerfEntry[]; // e.g. [{ ts: Date.now(), kind: "mcq", question, accuracy }]
+}) {
+  const userId = await whoami();
+  await assertOwnChat(params.chatId, userId);
+
+  const chat = await prisma.chat.findUnique({
+    where: { id: params.chatId },
+    select: { meta: true },
+  });
+
+  const meta = (chat?.meta ?? {}) as ChatMeta;
+  const perf = [...(meta.performance ?? []), ...params.entries];
+
+  await prisma.chat.update({
+    where: { id: params.chatId },
+    data: { meta: { ...(meta as any), performance: perf } as any },
+  });
+
+  return { ok: true as const, count: params.entries.length };
+}
+
+/* ============================================================
+   Misc utilities
+============================================================ */
 export async function renameChat(params: { chatId: string; title: string }) {
   const userId = await whoami();
   await assertOwnChat(params.chatId, userId);
@@ -249,35 +353,25 @@ export async function deleteChat(params: { chatId: string }) {
   return { ok: true as const };
 }
 
-
-type RoadmapSubtopic = { type: "SUBTOPIC"; name: string };
-type RoadmapTopic = { type: "TOPIC"; name: string; subtopics: RoadmapSubtopic[] };
-type Roadmap = RoadmapTopic[];
-
+/* ============================================================
+   Pathway integration
+============================================================ */
 export async function savePlanAsPathway(params: {
   chatId: string;
   plan: Roadmap;
   title?: string | null;
   status?: "DRAFT" | "ACTIVE" | "COMPLETED" | "ARCHIVED";
 }) {
-  const session = await getServerSession();
-  const userId = session?.user?.email
-    ? (await prisma.user.findFirst({ where: { email: session.user.email }, select: { id: true } }))?.id
-    : (await prisma.user.upsert({
-        where: { email: "guest@example.com" },
-        update: {},
-        create: { email: "guest@example.com", name: "Guest" },
-        select: { id: true },
-      }))!.id;
+  const userId = await whoami();
 
-  // Ownership check (optional but recommended)
+  // Ownership check
   const chat = await prisma.chat.findUnique({ where: { id: params.chatId }, select: { userId: true } });
   if (!chat || chat.userId !== userId) {
     return { ok: false as const, error: "Chat not found or not owned by user." };
   }
 
-  // If a pathway already exists for this chat, update it; else create it.
-  const existing = await prisma.pathway.findUnique({
+  // Update or create
+  const existing = await prisma.pathway.findFirst({
     where: { chatId: params.chatId },
     select: { id: true },
   });

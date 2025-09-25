@@ -1,3 +1,4 @@
+// src/components/mcq.tsx
 "use client";
 
 import { useState } from "react";
@@ -8,15 +9,25 @@ export type MCQCardProps = {
   options: string[];
   /** 0-indexed correct option */
   correctIndex: number;
+  /** Optional explanation */
+  explanation?: string;
   /** Optional: disable calling the server action (for demos/offline) */
   disableGrading?: boolean;
+  /** Notify parent so we can update meta.performance */
+  onGraded?: (payload: {
+    question: string;
+    correct: boolean;
+    score: number;
+  }) => void;
 };
 
 export function MCQCard({
   question,
   options,
   correctIndex,
+  explanation,
   disableGrading = false,
+  onGraded,
 }: MCQCardProps) {
   const [picked, setPicked] = useState<number | null>(null);
   const [submitting, setSubmitting] = useState(false);
@@ -34,13 +45,15 @@ export function MCQCard({
     try {
       if (disableGrading) {
         const correct = picked === correctIndex;
-        setResult({
+        const r = {
           correct,
           score: correct ? 1 : 0,
           rationale: correct
             ? "Demo mode: correct."
             : "Demo mode: not the expected option.",
-        });
+        };
+        setResult(r);
+        onGraded?.({ question, correct: r.correct, score: r.score });
       } else {
         const r = await gradeMCQ({
           question,
@@ -53,6 +66,7 @@ export function MCQCard({
           score: r.score,
           rationale: r.rationale,
         });
+        onGraded?.({ question, correct: r.correct, score: r.score });
       }
     } catch (e: any) {
       setErr(e?.message ?? "Failed to grade.");
@@ -88,6 +102,13 @@ export function MCQCard({
           </label>
         ))}
       </div>
+
+      {explanation && (
+        <div className="mt-2 text-xs text-neutral-400">
+          <span className="text-neutral-500">Hint: </span>
+          {explanation}
+        </div>
+      )}
 
       <div className="flex flex-col gap-2 mt-3">
         <button
