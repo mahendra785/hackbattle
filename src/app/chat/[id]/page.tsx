@@ -112,7 +112,7 @@ const CHAT_POST = `${API_BASE}/general`;
 const PDF_QUERY_POST = `${API_BASE}/pdf/query`;
 const WEB_SEARCH_POST = `${API_BASE}/web/search`; // ← implement this on your backend
 const CONTENT_GET = (q: string, ctx?: string) =>
-  `${API_BASE}/content/?q=${encodeURIComponent(q)}${
+  `${API_BASE}/ask?q=${encodeURIComponent(q)}${
     ctx ? `&context=${encodeURIComponent(ctx)}` : ""
   }&_ngrok_skip_browser_warning=true`;
 
@@ -477,12 +477,24 @@ function InteractiveRoadmap({
     const width = wrapper.clientWidth;
     const height = 220;
 
-    let svg = d3.select(svgRef.current);
+    let svg = d3.select(svgRef.current) as d3.Selection<
+      SVGSVGElement | null,
+      unknown,
+      null,
+      undefined
+    >;
     if (svg.empty()) {
-      svg = d3
-        .select(wrapper)
-        .append("svg")
-        .attr("ref", (el) => (svgRef.current = el as any));
+      // create an <svg> under the wrapper and keep the DOM ref
+      const wrapperSel = d3.select(wrapper);
+      const newSvg = wrapperSel.append("svg");
+      // store DOM node ref for later direct access
+      svgRef.current = newSvg.node() as SVGSVGElement | null;
+      svg = newSvg as d3.Selection<
+        SVGSVGElement | null,
+        unknown,
+        null,
+        undefined
+      >;
     }
     svg
       .attr("width", "100%")
@@ -516,51 +528,108 @@ function InteractiveRoadmap({
       .attr("fill", "#f59e0b");
 
     const g = svg.append("g");
-    const zoom = d3
+    // typed helpers for the zoom block
+    interface SVGZoomEvent extends d3.D3ZoomEvent<SVGSVGElement, unknown> {}
+    type SVGZoomBehavior = d3.ZoomBehavior<SVGSVGElement, unknown>;
+    type GSelection = d3.Selection<SVGGElement, unknown, null, undefined>;
+
+    const gSel = g as GSelection;
+
+    const zoom: SVGZoomBehavior = d3
       .zoom<SVGSVGElement, unknown>()
       .scaleExtent([0.7, 2])
-      .on("zoom", (e) => g.attr("transform", e.transform));
+      .on("zoom", (e: SVGZoomEvent) => {
+        // ZoomTransform#toString() returns a transform string suitable for attr("transform")
+        gSel.attr("transform", (e as any).transform.toString());
+      });
     svg.call(zoom as any);
 
-    g.selectAll("line.link")
-      .data(links)
+    interface RoadmapLink {
+      source: string;
+      target: string;
+    }
+
+    g.selectAll<SVGLineElement, RoadmapLink>("line.link")
+      .data(links as RoadmapLink[])
       .enter()
       .append("line")
       .attr("class", "link")
       .attr("stroke", "url(#edgeGrad)")
       .attr("stroke-width", 2)
       .attr("marker-end", "url(#arrow)")
-      .attr("x1", (d) => nodes.find((n) => n.id === d.source)!.x + 40)
-      .attr("y1", (d) => nodes.find((n) => n.id === d.source)!.y)
-      .attr("x2", (d) => nodes.find((n) => n.id === d.target)!.x - 40)
-      .attr("y2", (d) => nodes.find((n) => n.id === d.target)!.y);
+      .attr(
+        "x1",
+        (d: RoadmapLink) =>
+          (nodes as RoadmapNode[]).find((n) => n.id === d.source)!.x + 40
+      )
+      .attr(
+        "y1",
+        (d: RoadmapLink) =>
+          (nodes as RoadmapNode[]).find((n) => n.id === d.source)!.y
+      )
+      .attr(
+        "x2",
+        (d: RoadmapLink) =>
+          (nodes as RoadmapNode[]).find((n) => n.id === d.target)!.x - 40
+      )
+      .attr(
+        "y2",
+        (d: RoadmapLink) =>
+          (nodes as RoadmapNode[]).find((n) => n.id === d.target)!.y
+      );
 
-    const nodeGroup = g
-      .selectAll("g.node")
+    interface RoadmapNode {
+      id: string;
+      label: string;
+      index: number;
+      x: number;
+      y: number;
+    }
+
+    const nodeGroup: d3.Selection<
+      SVGGElement,
+      RoadmapNode,
+      SVGGElement,
+      unknown
+    > = g
+      .selectAll<SVGGElement, RoadmapNode>("g.node")
       .data(nodes)
       .enter()
       .append("g")
       .attr("class", "node")
-      .attr("transform", (d) => `translate(${d.x}, ${d.y})`);
+      .attr("transform", (d: RoadmapNode) => `translate(${d.x}, ${d.y})`);
 
     nodeGroup
-      .append("circle")
+      .append<SVGCircleElement>("circle")
       .attr("r", 38)
-      .attr("fill", (d) => (selectedTopic === d.index ? "#f59e0b" : "#111827"))
+      .attr("fill", (d: RoadmapNode) =>
+        selectedTopic === d.index ? "#f59e0b" : "#111827"
+      )
       .attr("stroke", "#f59e0b")
       .attr("stroke-width", 2)
       .style("cursor", "pointer")
-      .on("mouseover", function () {
-        d3.select(this).attr("fill", "#f59e0b").attr("r", 40);
-      })
-      .on("mouseout", function (_e, d: any) {
-        d3.select(this)
-          .attr("fill", selectedTopic === d.index ? "#f59e0b" : "#111827")
-          .attr("r", 38);
-      })
-      .on("click", function (_e, d: any) {
-        setSelectedTopic(selectedTopic === d.index ? null : d.index);
-      });
+      .on(
+        "mouseover",
+        function (this: SVGCircleElement, _e: MouseEvent, _d: RoadmapNode) {
+          d3.select<SVGCircleElement, RoadmapNode>(this)
+            .attr("fill", "#f59e0b")
+            .attr("r", 40);
+        }
+      )
+      .on(
+        "mouseout",
+        function (this: SVGCircleElement, _e: MouseEvent, d: RoadmapNode) {
+          d3.select<SVGCircleElement, RoadmapNode>(this)
+            .attr("fill", selectedTopic === d.index ? "#f59e0b" : "#111827")
+            .attr("r", 38);
+        }
+      )
+      .on(
+        "click",
+        function (this: SVGCircleElement, _e: MouseEvent, d: RoadmapNode) {
+          setSelectedTopic(selectedTopic === d.index ? null : d.index);
+        }
+      );
 
     nodeGroup
       .append("text")
@@ -570,8 +639,8 @@ function InteractiveRoadmap({
       .attr("fill", "#ffffff")
       .attr("font-weight", "600")
       .style("pointer-events", "none")
-      .each(function (d: any) {
-        const text = d3.select(this);
+      .each(function (this: SVGTextElement, d: any) {
+        const text = d3.select<SVGTextElement, any>(this);
         const words = String(d.label).split(/\s+/);
         if (words.length === 1 && d.label.length <= 12) text.text(d.label);
         else if (words.length <= 2) {
@@ -1492,35 +1561,53 @@ export default function ChatByIdPage() {
       canceled = true;
     };
   }, [chatId]);
+  // replace your current getAskRaw with this
   async function getAskRaw(
     query: string,
-    contextString?: string,
-    metadataString?: string
+    contextString?: string
   ): Promise<string> {
-    const base = ROADMAP_GET(query, contextString);
-    const url = metadataString
-      ? `${base}&metadata=${encodeURIComponent(metadataString)}`
-      : base;
+    // build URL safely
+    const url = new URL(`${API_BASE}/ask`);
+    url.searchParams.set("q", query);
+    if (contextString && contextString.trim()) {
+      url.searchParams.set("context", contextString);
+    }
+    // optional: tune retrieval size (backend supports it)
+    url.searchParams.set("top_k", "6");
+    url.searchParams.set("_ngrok_skip_browser_warning", "true");
 
-    const res = await fetch(url, {
+    const res = await fetch(url.toString(), {
       method: "GET",
+      mode: "cors",
       headers: {
         "ngrok-skip-browser-warning": "true",
-        Accept: "text/plain, application/json;q=0.9",
+        Accept: "application/json,text/plain;q=0.9",
         "Cache-Control": "no-cache",
       },
-      mode: "cors",
     });
-    const text = await res.text();
+
+    const bodyText = await res.text();
     const ct = res.headers.get("content-type") || "";
-    if (ct.includes("text/html") || text.includes("ERR_NGROK_6024")) {
+
+    if (ct.includes("text/html") || bodyText.includes("ERR_NGROK_6024")) {
       throw new Error("Ngrok splash intercepted the request.");
     }
     if (!res.ok) {
-      throw new Error(`Backend error ${res.status}: ${text.substring(0, 200)}`);
+      throw new Error(
+        `Backend error ${res.status}: ${bodyText.substring(0, 200)}`
+      );
     }
-    return text;
+
+    // Backend returns JSON (array of topics). We return a string so downstream
+    // code can do tryExtractRoadmapFromText on it.
+    // If it's already JSON, keep it as the original JSON string; otherwise pass through.
+    if (ct.includes("application/json")) {
+      // bodyText is already the JSON string representing the roadmap array
+      return bodyText;
+    }
+    return bodyText;
   }
+
   // ---- helpers (quiz intent) ----
   function isQuizIntent(q: string) {
     const s = q.toLowerCase();
@@ -1912,11 +1999,7 @@ export default function ChatByIdPage() {
             selectedTopic: selectedLearningTopic,
             lastRoadmap: null,
           });
-          const raw = await getAskRaw(
-            question,
-            contextString,
-            JSON.stringify(md)
-          );
+          const raw = await getAskRaw(question, contextString);
 
           const plan = tryExtractRoadmapFromText(raw);
 
