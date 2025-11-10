@@ -359,7 +359,7 @@ export default function Home() {
             ref={attachReveal}
           >
             <button
-              onClick={() => signIn("google", { callbackUrl: "/dashboard" })}
+              onClick={() => signIn("google", { callbackUrl: "/chat" })}
               className="group relative bg-gradient-to-r from-amber-500 to-amber-600 text-black px-6 sm:px-8 py-3 rounded-full text-sm sm:text-base md:text-lg font-bold hover:shadow-[0_0_0_1px_rgba(255,255,255,0.08),0_10px_50px_-12px_rgba(255,193,7,0.45)] transition transform hover:scale-[1.03] focus:outline-none focus-visible:ring-2 focus-visible:ring-amber-300 w-full sm:w-auto"
             >
               <span className="relative z-10 flex items-center justify-center gap-2 sm:gap-3">
@@ -499,7 +499,7 @@ export default function Home() {
 
           {!session?.user && (
             <button
-              onClick={() => signIn("google", { callbackUrl: "/dashboard" })}
+              onClick={() => signIn("google", { callbackUrl: "/chat" })}
               className="group relative bg-gradient-to-r from-amber-500 to-amber-600 text-black px-8 sm:px-10 py-3.5 sm:py-4 rounded-full text-base sm:text-lg font-bold hover:shadow-[0_0_0_1px_rgba(255,255,255,0.08),0_10px_50px_-12px_rgba(255,193,7,0.45)] transition transform hover:scale-[1.03] focus:outline-none focus-visible:ring-2 focus-visible:ring-amber-300"
               style={{ boxShadow: "0 0 80px rgba(245, 158, 11, 0.28)" }}
             >
