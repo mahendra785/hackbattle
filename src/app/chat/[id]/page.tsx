@@ -103,7 +103,7 @@ type Meta = {
 /* =========================
    Config
 ========================= */
-const API_BASE = " https://f064b4de2db3.ngrok-free.app";
+const API_BASE = "https://4ba87256ffd0.ngrok-free.app";
 const ROADMAP_GET = (q: string, ctx?: string) =>
   `${API_BASE}/ask?q=${encodeURIComponent(q)}${
     ctx ? `&context=${encodeURIComponent(ctx)}` : ""
