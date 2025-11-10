@@ -14,7 +14,7 @@ export async function classifyPrompt(prompt: string) {
   }
 
   const genai = new GoogleGenerativeAI(apiKey);
-  const model = genai.getGenerativeModel({ model: "gemini-1.5-flash" });
+  const model = genai.getGenerativeModel({ model: "gemini-2.0-flash" });
 
   // Keep the instruction short and force strict JSON
   const instruction =

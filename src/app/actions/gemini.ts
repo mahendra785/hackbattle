@@ -15,7 +15,7 @@ export type GeneratedTextQ = {
   context?: string;
 };
 
-const MODEL = process.env.GEMINI_MODEL || "gemini-1.5-pro";
+const MODEL = process.env.GEMINI_MODEL || "gemini-2.0-flash";
 const API_KEY = process.env.GOOGLE_API_KEY!;
 if (!API_KEY) {
   console.warn("[gemini] Missing GOOGLE_API_KEY env var");

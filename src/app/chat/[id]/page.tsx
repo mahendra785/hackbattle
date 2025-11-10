@@ -103,7 +103,7 @@ type Meta = {
 /* =========================
    Config
 ========================= */
-const API_BASE = "https://retiform-leonida-stifledly.ngrok-free.dev";
+const API_BASE = "http://localhost:8000";
 const ROADMAP_GET = (q: string, ctx?: string) =>
   `${API_BASE}/ask?q=${encodeURIComponent(q)}${
     ctx ? `&context=${encodeURIComponent(ctx)}` : ""
